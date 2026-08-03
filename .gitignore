@@ -1,0 +1,18 @@
+.workbench/
+__pycache__/
+.env
+.DS_Store
+
+# 本地内容数据：文章、来源卡、质检报告和素材清单不进入公开仓库
+/*.md
+!/README.md
+/*.docx
+
+# 本地生成或导入的图片、视频与素材目录
+*_assets/
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.pyc
