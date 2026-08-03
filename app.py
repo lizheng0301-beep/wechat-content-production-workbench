@@ -56,6 +56,8 @@ HOST = "127.0.0.1"
 PORT = int(os.getenv("WORKBENCH_PORT", "8765"))
 AIHOT_BASE = "https://aihot.virxact.com/api/v1"
 USER_AGENT = "EditorialWorkbench/1.0 (+local)"
+AUTO_IMAGE_JOBS: dict[str, dict] = {}
+AUTO_IMAGE_JOBS_LOCK = threading.Lock()
 
 
 def now_iso() -> str:
@@ -729,7 +731,7 @@ def download_url(url: str, max_bytes: int = 6 * 1024 * 1024) -> tuple[bytes, str
         return data, content_type
 
 
-def import_images_from_url(page_url: str) -> dict:
+def import_images_from_url(page_url: str, limit: int = 8) -> dict:
     page_bytes, content_type = download_url(page_url, max_bytes=4 * 1024 * 1024)
     candidates = []
     if content_type.startswith("image/"):
@@ -744,7 +746,7 @@ def import_images_from_url(page_url: str) -> dict:
         if candidate and candidate not in unique and urlparse(candidate).scheme in {"http", "https"}:
             unique.append(candidate)
     imported = []
-    for image_url in unique[:8]:
+    for image_url in unique[:max(1, min(limit, 8))]:
         try:
             data, mime = download_url(image_url)
             if not mime.startswith("image/"):
@@ -775,8 +777,35 @@ def image_count_in_markdown(body: str) -> int:
     return len(re.findall(r"!\[[^\]]*\]\([^)]*\)", body or ""))
 
 
+def split_long_image_block(block: str, max_chars: int = 560) -> list[str]:
+    """Split a long prose block at sentence boundaries so image slots can be placed naturally."""
+    clean = block.strip()
+    if len(markdown_text_only(clean)) <= max_chars or clean.startswith(("#", "!")):
+        return [clean]
+    sentences = [item.strip() for item in re.split(r"(?<=[。！？!?；;])\s*", clean) if item.strip()]
+    if len(sentences) <= 1:
+        return [clean[index:index + max_chars].strip() for index in range(0, len(clean), max_chars)]
+    chunks: list[str] = []
+    current: list[str] = []
+    current_length = 0
+    for sentence in sentences:
+        sentence_length = len(markdown_text_only(sentence))
+        if current and current_length + sentence_length > max_chars:
+            chunks.append("".join(current).strip())
+            current = []
+            current_length = 0
+        current.append(sentence)
+        current_length += sentence_length
+    if current:
+        chunks.append("".join(current).strip())
+    return chunks or [clean]
+
+
 def choose_image_blocks(body: str) -> tuple[list[str], list[int], int]:
-    blocks = [block.strip() for block in re.split(r"\n\s*\n", body or "") if block.strip()]
+    raw_blocks = [block.strip() for block in re.split(r"\n\s*\n", body or "") if block.strip()]
+    blocks: list[str] = []
+    for block in raw_blocks:
+        blocks.extend(split_long_image_block(block))
     text_length = len(markdown_text_only(body or ""))
     target_count = (text_length + 499) // 500 if text_length else 0
     existing_count = image_count_in_markdown(body or "")
@@ -840,6 +869,7 @@ def auto_layout_draft_images(draft_id: int, body_override: str = "", title_overr
     if not body:
         raise ValueError("正文为空，先生成或写入文章正文")
     blocks, positions, target_count = choose_image_blocks(body)
+    existing_count = image_count_in_markdown(body)
     if not positions:
         return {"ok": True, "draft": draft, "target_count": target_count, "inserted": [], "source_imported": [],
                 "generated": [], "failed": [], "message": f"正文已有足够配图（目标 {target_count} 张），暂不重复添加"}
@@ -850,7 +880,7 @@ def auto_layout_draft_images(draft_id: int, body_override: str = "", title_overr
     import_failures: list[str] = []
     for page_url in page_urls:
         try:
-            result = import_images_from_url(page_url)
+            result = import_images_from_url(page_url, limit=4)
             imported.extend(result.get("imported", []))
         except Exception as exc:
             import_failures.append(f"{page_url}：{redact_sensitive(exc)}")
@@ -898,11 +928,35 @@ def auto_layout_draft_images(draft_id: int, body_override: str = "", title_overr
     with db_conn() as conn:
         conn.execute("UPDATE draft SET body=?,digest=?,status=?,updated_at=? WHERE id=?", (new_body, markdown_text_only(new_body)[:120], "待排版", now_iso(), draft_id))
         updated = conn.execute("SELECT * FROM draft WHERE id=?", (draft_id,)).fetchone()
-    message = f"已按约每 500 字规划 {target_count} 张图：来源图 {source_used} 张，AI 补图 {len(generated)} 张"
+    completed_count = existing_count + len(inserted)
+    remaining_count = max(0, target_count - completed_count)
+    message = f"配图规划 {target_count} 张：本次来源图 {source_used} 张，AI 补图 {len(generated)} 张，正文现有 {existing_count} 张"
+    if remaining_count:
+        message += f"，仍缺 {remaining_count} 张"
     if failures:
-        message += f"，{len(failures)} 张未完成"
+        detail = "；".join(str(item) for item in failures[:2])
+        message += f"。失败 {len(failures)} 项：{detail}"
     return {"ok": True, "draft": row_to_json(updated), "target_count": target_count, "planned": positions,
-            "inserted": inserted, "source_imported": unique_assets, "generated": generated, "failed": failures, "message": message}
+            "inserted": inserted, "source_imported": unique_assets, "generated": generated, "failed": failures,
+            "remaining": remaining_count, "message": message}
+
+
+def run_auto_image_job(job_id: str, draft_id: int, body: str, title: str) -> None:
+    try:
+        with AUTO_IMAGE_JOBS_LOCK:
+            AUTO_IMAGE_JOBS[job_id]["message"] = "正在读取原文图片；来源图不足时再生成…"
+        result = auto_layout_draft_images(draft_id, body, title)
+        with AUTO_IMAGE_JOBS_LOCK:
+            AUTO_IMAGE_JOBS[job_id].update({"status": "done", "message": result.get("message", "自动配图完成"), "result": result})
+    except Exception as exc:
+        with AUTO_IMAGE_JOBS_LOCK:
+            AUTO_IMAGE_JOBS[job_id].update({"status": "failed", "message": redact_sensitive(exc), "error": redact_sensitive(exc)})
+    finally:
+        with AUTO_IMAGE_JOBS_LOCK:
+            if len(AUTO_IMAGE_JOBS) > 48:
+                finished = [key for key, value in AUTO_IMAGE_JOBS.items() if value.get("status") in {"done", "failed"}]
+                for key in finished[:max(0, len(AUTO_IMAGE_JOBS) - 32)]:
+                    AUTO_IMAGE_JOBS.pop(key, None)
 
 
 def image_prompt_from_selection(selected_text: str, title: str = "", context: str = "") -> dict:
@@ -1444,6 +1498,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json([row_to_json(row) for row in rows])
             if path == "/api/topics":
                 return self.send_json(get_topics())
+            auto_image_job_match = re.match(r"^/api/drafts/(\d+)/auto-images/([0-9a-f-]+)$", path)
+            if auto_image_job_match:
+                draft_id, job_id = int(auto_image_job_match.group(1)), auto_image_job_match.group(2)
+                with AUTO_IMAGE_JOBS_LOCK:
+                    job = dict(AUTO_IMAGE_JOBS.get(job_id, {}))
+                if not job or int(job.get("draft_id", 0)) != draft_id:
+                    return self.send_json({"error": "自动配图任务不存在或已过期"}, 404)
+                return self.send_json({"ok": True, **job})
             if path == "/api/drafts":
                 return self.send_json(get_drafts())
             if path == "/api/assets":
@@ -1553,7 +1615,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"ok": True, "draft_id": cursor.lastrowid})
             auto_images_match = re.match(r"^/api/drafts/(\d+)/auto-images$", path)
             if auto_images_match:
-                return self.send_json(auto_layout_draft_images(int(auto_images_match.group(1)), str(body.get("body", "")), str(body.get("title", ""))))
+                draft_id = int(auto_images_match.group(1))
+                with db_conn() as conn:
+                    if not conn.execute("SELECT 1 FROM draft WHERE id=?", (draft_id,)).fetchone():
+                        raise ValueError("草稿不存在")
+                with AUTO_IMAGE_JOBS_LOCK:
+                    active = next((dict(value, job_id=key) for key, value in AUTO_IMAGE_JOBS.items()
+                                   if int(value.get("draft_id", 0)) == draft_id and value.get("status") == "running"), None)
+                    if active:
+                        return self.send_json({"ok": True, **active}, 202)
+                    job_id = uuid.uuid4().hex
+                    AUTO_IMAGE_JOBS[job_id] = {"draft_id": draft_id, "status": "running", "message": "任务已开始，正在准备配图…"}
+                threading.Thread(target=run_auto_image_job, args=(job_id, draft_id, str(body.get("body", "")), str(body.get("title", ""))), daemon=True).start()
+                return self.send_json({"ok": True, "job_id": job_id, "draft_id": draft_id, "status": "running", "message": "任务已开始，正在读取原文图片…"}, 202)
             draft_match = re.match(r"^/api/drafts/(\d+)/(generate|quality|save|readability)$", path)
             if draft_match:
                 draft_id, action = int(draft_match.group(1)), draft_match.group(2)
