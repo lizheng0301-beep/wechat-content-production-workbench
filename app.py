@@ -556,6 +556,46 @@ def local_draft(topic: dict, source: dict | None) -> dict:
             "mode": "local_template"}
 
 
+def local_readability_markup(markdown: str) -> str:
+    blocks = [block for block in re.split(r"(\n\s*\n)", markdown or "")]
+    for index, block in enumerate(blocks):
+        clean = block.strip()
+        if not clean or clean.startswith(("#", ">", "!", "- ", "* ")) or re.match(r"^\d+[.)] ", clean):
+            continue
+        if "**" in clean or "==" in clean or "__" in clean or "^^" in clean:
+            continue
+        marked = re.sub(r"([「“][^」”]{2,24}[」”])", r"**\1**", clean, count=1)
+        if marked == clean:
+            marked = re.sub(r"(真正重要的是|关键在于|我更在意的是|所以，)([^。！？]{4,22})", r"\1**\2**", clean, count=1)
+        if marked != clean:
+            blocks[index] = block.replace(clean, marked, 1)
+    return "".join(blocks)
+
+
+def readability_markup(markdown: str, title: str = "") -> dict:
+    prompt = f"""你是公众号排版编辑。只给下面这篇 Markdown 正文增加少量可读性标记，不得改写、删减、补造或调换任何文字。
+允许的标记只有：**重点加粗**、==重点高亮==、__重点下划线__、^^朱砂强调色^^。
+每 300 到 500 字最多标记 1 到 2 处，优先标记结论、转折、关键判断或读者需要记住的短句，不要整段加粗，不要给标题加标记。
+输出 JSON，只有一个字段 body。
+
+文章标题：{title}
+正文：
+{markdown}
+"""
+    ok, text, error = read_text_model(prompt, "你是一名克制的公众号排版编辑，只做信息层级，不改变作者原文。")
+    if ok:
+        match = re.search(r"\{.*\}", text, re.S)
+        if match:
+            try:
+                result = json.loads(match.group(0))
+                body = str(result.get("body", "")).strip()
+                if body and len(markdown_text_only(body)) == len(markdown_text_only(markdown)):
+                    return {"body": body, "mode": "model", "message": "已整理重点层级，原文内容未改动"}
+            except json.JSONDecodeError:
+                pass
+    return {"body": local_readability_markup(markdown), "mode": "local_fallback", "message": error or "已用本地规则整理少量重点"}
+
+
 def generate_draft(draft_id: int) -> dict:
     with db_conn() as conn:
         draft_row = conn.execute("SELECT * FROM draft WHERE id=?", (draft_id,)).fetchone()
@@ -568,7 +608,7 @@ def generate_draft(draft_id: int) -> dict:
     prompt = f"""你是一个公众号编辑协作者。请基于以下资料生成一篇可编辑的中文公众号长文草稿。
 不要编造作者经历、数字、引语或事实。所有个人经历必须保留为待补位置。
 风格参考是「有见识的普通人在认真聊一件打动他的事」，短段落，口语化，具体切入，避免模板化总结。
-正文目标为 1800 到 2600 个中文字符，至少 10 个自然段，并使用 4 到 6 个 Markdown 二级标题组织阅读节奏。不要用项目符号把正文堆成提纲，每个段落都要有完整意思。资料不足时写清楚待核验或待补位置，不要用泛泛的励志话填充。
+正文目标为 1800 到 2600 个中文字符，至少 10 个自然段，并使用 4 到 6 个 Markdown 二级标题组织阅读节奏。不要用项目符号把正文堆成提纲，每个段落都要有完整意思。资料不足时写清楚待核验或待补位置，不要用泛泛的励志话填充。为了提高可读性，可以少量使用 **重点加粗**、==重点高亮==、__重点下划线__ 或 ^^朱砂强调色^^，每 300 到 500 字最多标记 1 到 2 处，不要整段加粗。
 输出 JSON，字段为 title_candidates（3个标题）、title、digest、outline（数组）、body、evidence（数组）、claims（数组）。claims 中明确区分 kind= fact / judgement / inference，并为 fact 填写 source。
 
 选题：{json.dumps(topic, ensure_ascii=False)}
@@ -724,6 +764,147 @@ def import_images_from_url(page_url: str) -> dict:
     return {"page_url": page_url, "found": len(unique), "imported": imported, "message": f"识别到 {len(unique)} 张图片，导入 {len(imported)} 张"}
 
 
+def markdown_text_only(value: str) -> str:
+    value = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", value)
+    value = re.sub(r"^#{1,6}\s+", "", value.strip())
+    value = re.sub(r"[*_`=~^]", "", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def image_count_in_markdown(body: str) -> int:
+    return len(re.findall(r"!\[[^\]]*\]\([^)]*\)", body or ""))
+
+
+def choose_image_blocks(body: str) -> tuple[list[str], list[int], int]:
+    blocks = [block.strip() for block in re.split(r"\n\s*\n", body or "") if block.strip()]
+    text_length = len(markdown_text_only(body or ""))
+    target_count = (text_length + 499) // 500 if text_length else 0
+    existing_count = image_count_in_markdown(body or "")
+    needed = max(0, target_count - existing_count)
+    eligible = [i for i, block in enumerate(blocks)
+                if not block.startswith("!") and not block.startswith("#") and len(markdown_text_only(block)) >= 55]
+    if not eligible or not needed:
+        return blocks, [], target_count
+    cumulative = 0
+    positions: list[int] = []
+    thresholds = [500 * (i + 1) for i in range(needed)]
+    for index, block in enumerate(blocks):
+        cumulative += len(markdown_text_only(block))
+        if index not in eligible:
+            continue
+        if thresholds and cumulative >= thresholds[0]:
+            positions.append(index)
+            thresholds.pop(0)
+    for index in reversed(eligible):
+        if len(positions) >= needed:
+            break
+        if index not in positions:
+            positions.append(index)
+    return blocks, sorted(positions[:needed]), target_count
+
+
+def source_urls_for_draft(topic: dict, evidence: list) -> list[str]:
+    urls: list[str] = []
+    source_url = str(topic.get("source_url") or "").strip()
+    if source_url:
+        urls.append(source_url)
+    for item in evidence if isinstance(evidence, list) else []:
+        if isinstance(item, dict):
+            url = str(item.get("url") or item.get("source_url") or "").strip()
+            if url:
+                urls.append(url)
+    return list(dict.fromkeys(url for url in urls if urlparse(url).scheme in {"http", "https"}))
+
+
+def insert_image_blocks(blocks: list[str], placements: dict[int, dict]) -> str:
+    output: list[str] = []
+    for index, block in enumerate(blocks):
+        output.append(block)
+        asset = placements.get(index)
+        if asset:
+            alt = re.sub(r"\s+", " ", str(asset.get("name", "正文配图"))).strip() or "正文配图"
+            output.append(f"![{alt}]({asset['path']})")
+    return "\n\n".join(output)
+
+
+def auto_layout_draft_images(draft_id: int, body_override: str = "", title_override: str = "") -> dict:
+    with db_conn() as conn:
+        draft_row = conn.execute("SELECT * FROM draft WHERE id=?", (draft_id,)).fetchone()
+        topic_row = conn.execute("SELECT t.*, s.source_url, s.aihot_url, s.title AS source_title FROM topic t LEFT JOIN source_item s ON s.id=t.source_id WHERE t.id=?", (draft_row["topic_id"],)).fetchone() if draft_row and draft_row["topic_id"] else None
+    if not draft_row:
+        raise ValueError("草稿不存在")
+    draft = row_to_json(draft_row) or {}
+    topic = row_to_json(topic_row) or {}
+    body = str(body_override or draft.get("body") or "").strip()
+    title = str(title_override or draft.get("title") or draft.get("topic_title") or "未命名文章").strip()
+    if not body:
+        raise ValueError("正文为空，先生成或写入文章正文")
+    blocks, positions, target_count = choose_image_blocks(body)
+    if not positions:
+        return {"ok": True, "draft": draft, "target_count": target_count, "inserted": [], "source_imported": [],
+                "generated": [], "failed": [], "message": f"正文已有足够配图（目标 {target_count} 张），暂不重复添加"}
+
+    evidence = draft.get("evidence") if isinstance(draft.get("evidence"), list) else []
+    page_urls = source_urls_for_draft(topic, evidence)[:3]
+    imported: list[dict] = []
+    import_failures: list[str] = []
+    for page_url in page_urls:
+        try:
+            result = import_images_from_url(page_url)
+            imported.extend(result.get("imported", []))
+        except Exception as exc:
+            import_failures.append(f"{page_url}：{redact_sensitive(exc)}")
+
+    source_hosts = {urlparse(url).hostname for url in page_urls if urlparse(url).hostname}
+    if source_hosts:
+        with db_conn() as conn:
+            existing_source_assets = conn.execute("SELECT * FROM asset WHERE kind='image' AND usage='来源图' ORDER BY id DESC LIMIT 120").fetchall()
+        for row in existing_source_assets:
+            asset = row_to_json(row) or {}
+            if urlparse(str(asset.get("source_url") or "")).hostname in source_hosts:
+                imported.append(asset)
+
+    unique_assets: list[dict] = []
+    seen_asset_ids: set[int] = set()
+    for asset in imported:
+        asset_id = int(asset.get("id", 0) or 0)
+        if asset_id and asset_id not in seen_asset_ids:
+            unique_assets.append(asset)
+            seen_asset_ids.add(asset_id)
+
+    placements: dict[int, dict] = {}
+    source_used = 0
+    generated: list[dict] = []
+    failures = list(import_failures)
+    for slot_index, block_index in enumerate(positions):
+        if source_used < len(unique_assets):
+            asset = unique_assets[source_used]
+            source_used += 1
+            placements[block_index] = asset
+            continue
+        selected = markdown_text_only(blocks[block_index])[:1000]
+        context = "\n".join(markdown_text_only(blocks[i])[:260] for i in range(max(0, block_index - 1), min(len(blocks), block_index + 2)))
+        try:
+            prompt_result = image_prompt_from_selection(selected, title, context)
+            generated_asset = generate_image_asset(prompt_result["prompt"], "正文插图")
+            generated_asset["image_prompt"] = prompt_result["prompt"]
+            placements[block_index] = generated_asset
+            generated.append(generated_asset)
+        except Exception as exc:
+            failures.append(f"第 {slot_index + 1} 张配图：{redact_sensitive(exc)}")
+
+    new_body = insert_image_blocks(blocks, placements)
+    inserted = list(placements.values())
+    with db_conn() as conn:
+        conn.execute("UPDATE draft SET body=?,digest=?,status=?,updated_at=? WHERE id=?", (new_body, markdown_text_only(new_body)[:120], "待排版", now_iso(), draft_id))
+        updated = conn.execute("SELECT * FROM draft WHERE id=?", (draft_id,)).fetchone()
+    message = f"已按约每 500 字规划 {target_count} 张图：来源图 {source_used} 张，AI 补图 {len(generated)} 张"
+    if failures:
+        message += f"，{len(failures)} 张未完成"
+    return {"ok": True, "draft": row_to_json(updated), "target_count": target_count, "planned": positions,
+            "inserted": inserted, "source_imported": unique_assets, "generated": generated, "failed": failures, "message": message}
+
+
 def image_prompt_from_selection(selected_text: str, title: str = "", context: str = "") -> dict:
     selected_text = selected_text.strip()
     if not selected_text:
@@ -731,7 +912,8 @@ def image_prompt_from_selection(selected_text: str, title: str = "", context: st
     selected_text = selected_text[:2400]
     context = context.strip()[:1200]
     prompt = f"""你是公众号编辑部的视觉编辑。请把下面选中的文章段落转换成一条可直接用于图片生成模型的中文提示词。
-不要复述文章，不要生成图片中的文字，不要编造真实人物、品牌标志或新闻现场。画面要服务于文章段落，优先使用具体物件、环境、动作和光线表达抽象观点。
+不要复述文章，不要生成图片中的文字，不要编造真实人物、品牌标志或新闻现场。画面必须服务于段落中明确出现的事实、对象、动作或环境；如果段落只有抽象判断，就用一个克制、可理解的日常物件或真实空间承载它，不要制造无意义的“科技感”。
+禁止机器人、发光网络、漂浮图标、随机仪表盘、通用蓝紫渐变、无关人物、无关城市天际线和装饰性 3D 图标。
 输出 JSON，字段为 prompt、visual_intent、avoid。prompt 只写最终生图提示词，包含主体、场景、构图、镜头或光线、色彩和编辑视觉风格，并明确“画面内不要出现文字、水印、Logo”。
 
 文章标题：{title}
@@ -750,10 +932,11 @@ def image_prompt_from_selection(selected_text: str, title: str = "", context: st
                             "avoid": str(result.get("avoid", "")), "mode": "model"}
             except json.JSONDecodeError:
                 pass
-    fallback = (f"公众号编辑部风格的纪实概念插画，围绕“{selected_text[:180]}”表达核心关系，"
-                "用具体物件和环境隐喻文章观点，米白纸张、墨黑主体、朱砂红和荧光绿少量点缀，"
-                "杂志编辑视觉，留白充足，层次清楚，柔和侧光，横向构图，画面内不要出现文字、水印、Logo。")
-    return {"prompt": fallback, "visual_intent": "把选中段落转成编辑部风格的概念画面", "avoid": "文字、水印、Logo、虚构人物", "mode": "local_fallback", "model_note": error or "未配置文本模型，使用本地提示词转换"}
+    fallback = (f"为公众号正文制作一张克制的纪实编辑配图，准确围绕段落中的具体内容“{selected_text[:180]}”取一个可视化瞬间；"
+                "优先使用真实日常物件、工作台、纸张、屏幕、手部动作或室内环境，不添加段落没有提到的人物和符号；"
+                "自然光，低饱和米白、墨黑、少量朱砂红，平面摄影或杂志纪实摄影，构图清楚，留白适中，横向 4:3。"
+                "画面内不要出现文字、水印、Logo、机器人、发光网络、漂浮图标、蓝紫渐变和通用科技背景。")
+    return {"prompt": fallback, "visual_intent": "把段落中的具体对象或动作转成纪实配图", "avoid": "文字、水印、Logo、机器人、发光网络、漂浮图标、通用科技背景", "mode": "local_fallback", "model_note": error or "未配置文本模型，使用本地提示词转换"}
 
 
 def save_generated_image(raw: bytes, prompt: str, usage: str, rights_note: str) -> dict:
@@ -984,6 +1167,7 @@ def md_to_html(markdown: str, image_map: dict[str, str] | None = None) -> str:
     lines = markdown.replace("\r\n", "\n").split("\n")
     output: list[str] = []
     list_tag = ""
+    lead_paragraph = True
 
     def close_list() -> None:
         nonlocal list_tag
@@ -1002,6 +1186,7 @@ def md_to_html(markdown: str, image_map: dict[str, str] | None = None) -> str:
             alt, src = image_match.groups()
             src = image_map.get(src, src)
             output.append(f'<p style="margin:25px 0;text-align:center"><img src="{html.escape(src, quote=True)}" alt="{html.escape(alt, quote=True)}" style="max-width:100%;height:auto;display:block;margin:0 auto;border-radius:8px"></p>')
+            lead_paragraph = False
         elif line == "---":
             close_list()
             output.append('<hr style="border:0;border-top:1px solid #d8d0c3;margin:28px 0">')
@@ -1011,12 +1196,15 @@ def md_to_html(markdown: str, image_map: dict[str, str] | None = None) -> str:
         elif line.startswith("### "):
             close_list()
             output.append(f'<h3 style="font-size:17px;line-height:1.5;margin:1.8em 0 .7em;color:#4f483e">{inline_html(line[4:], image_map)}</h3>')
+            lead_paragraph = True
         elif line.startswith("## "):
             close_list()
             output.append(f'<h2 style="font-size:21px;line-height:1.45;margin:2.1em 0 .8em;padding-left:12px;border-left:4px solid #b44735;color:#1d1c19">{inline_html(line[3:], image_map)}</h2>')
+            lead_paragraph = True
         elif line.startswith("# "):
             close_list()
             output.append(f'<h1 style="font-size:28px;line-height:1.35;margin:0 0 1.2em;color:#1d1c19">{inline_html(line[2:], image_map)}</h1>')
+            lead_paragraph = True
         elif re.match(r"^[-*] ", line) or re.match(r"^\d+[.)] ", line):
             wanted = "ol" if re.match(r"^\d+[.)] ", line) else "ul"
             if list_tag != wanted:
@@ -1027,7 +1215,11 @@ def md_to_html(markdown: str, image_map: dict[str, str] | None = None) -> str:
             output.append(f"<li>{inline_html(content, image_map)}</li>")
         else:
             close_list()
-            output.append(f'<p style="margin:0 0 1.25em;line-height:1.95;color:#37332d;font-size:16px">{inline_html(line, image_map)}</p>')
+            if lead_paragraph:
+                output.append(f'<p style="margin:0 0 1.35em;line-height:2;color:#37332d;font-size:17px;letter-spacing:.01em">{inline_html(line, image_map)}</p>')
+                lead_paragraph = False
+            else:
+                output.append(f'<p style="margin:0 0 1.25em;line-height:1.95;color:#37332d;font-size:16px">{inline_html(line, image_map)}</p>')
     close_list()
     return "".join(output)
 
@@ -1036,6 +1228,9 @@ def inline_html(value: str, image_map: dict[str, str]) -> str:
     escaped = html.escape(value)
     escaped = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r'<a href="\2">\1</a>', escaped)
     escaped = re.sub(r"\*\*([^*]+)\*\*", r'<strong>\1</strong>', escaped)
+    escaped = re.sub(r"==([^=]+)==", r'<mark style="background:#eff5b7;color:#343b20;padding:0 3px">\1</mark>', escaped)
+    escaped = re.sub(r"__([^_]+)__", r'<u style="text-decoration-color:#b44735;text-underline-offset:3px">\1</u>', escaped)
+    escaped = re.sub(r"\^\^([^\^]+)\^\^", r'<span style="color:#b44735;font-weight:600">\1</span>', escaped)
     escaped = re.sub(r"`([^`]+)`", r'<code style="background:#eee8dc;padding:2px 5px;border-radius:4px">\1</code>', escaped)
     return escaped
 
@@ -1356,11 +1551,25 @@ class Handler(BaseHTTPRequestHandler):
                 with db_conn() as conn:
                     cursor = conn.execute("INSERT INTO draft(topic_id,status,created_at,updated_at) VALUES(?,?,?,?)", (topic_id, "写作中", now_iso(), now_iso()))
                 return self.send_json({"ok": True, "draft_id": cursor.lastrowid})
-            draft_match = re.match(r"^/api/drafts/(\d+)/(generate|quality|save)$", path)
+            auto_images_match = re.match(r"^/api/drafts/(\d+)/auto-images$", path)
+            if auto_images_match:
+                return self.send_json(auto_layout_draft_images(int(auto_images_match.group(1)), str(body.get("body", "")), str(body.get("title", ""))))
+            draft_match = re.match(r"^/api/drafts/(\d+)/(generate|quality|save|readability)$", path)
             if draft_match:
                 draft_id, action = int(draft_match.group(1)), draft_match.group(2)
                 if action == "generate":
                     return self.send_json(generate_draft(draft_id))
+                if action == "readability":
+                    with db_conn() as conn:
+                        draft_for_layout = conn.execute("SELECT title,body FROM draft WHERE id=?", (draft_id,)).fetchone()
+                    if not draft_for_layout:
+                        raise ValueError("草稿不存在")
+                    layout = readability_markup(str(body.get("body", "")) or draft_for_layout["body"] or "", str(body.get("title", "")) or draft_for_layout["title"] or "")
+                    with db_conn() as conn:
+                        conn.execute("UPDATE draft SET body=?,digest=?,status=?,updated_at=? WHERE id=?", (layout["body"], markdown_text_only(layout["body"])[:120], "待排版", now_iso(), draft_id))
+                        updated = conn.execute("SELECT * FROM draft WHERE id=?", (draft_id,)).fetchone()
+                    layout["draft"] = row_to_json(updated)
+                    return self.send_json(layout)
                 if action == "quality":
                     with db_conn() as conn:
                         draft_for_quality = conn.execute("SELECT evidence FROM draft WHERE id=?", (draft_id,)).fetchone()
