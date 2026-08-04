@@ -155,6 +155,8 @@ def init_db() -> None:
               path TEXT NOT NULL,
               kind TEXT DEFAULT 'image',
               source_url TEXT DEFAULT '',
+              source_page_url TEXT DEFAULT '',
+              source_kind TEXT DEFAULT 'unknown',
               rights_note TEXT DEFAULT '待人工确认',
               prompt TEXT DEFAULT '',
               usage TEXT DEFAULT '',
@@ -197,6 +199,10 @@ def init_db() -> None:
         for column, definition in (("title_candidates", "TEXT DEFAULT '[]'"), ("claims", "TEXT DEFAULT '[]'"), ("style_profile_id", "INTEGER")):
             if column not in draft_columns:
                 conn.execute(f"ALTER TABLE draft ADD COLUMN {column} {definition}")
+        asset_columns = {row[1] for row in conn.execute("PRAGMA table_info(asset)").fetchall()}
+        for column, definition in (("source_page_url", "TEXT DEFAULT ''"), ("source_kind", "TEXT DEFAULT 'unknown'")):
+            if column not in asset_columns:
+                conn.execute(f"ALTER TABLE asset ADD COLUMN {column} {definition}")
 
 
 def table_rows(table: str, limit: int = 100) -> list[dict]:
@@ -477,6 +483,9 @@ def row_to_json(row: sqlite3.Row | None) -> dict | None:
     for key in ("raw_json", "outline", "evidence", "title_candidates", "claims", "quality_report"):
         if key in result:
             result[key] = safe_json_load(result[key], {} if key == "quality_report" else [])
+    for key in ("outline", "evidence", "title_candidates", "claims"):
+        if key in result and not isinstance(result[key], list):
+            result[key] = [result[key]] if result[key] else []
     return result
 
 
@@ -517,8 +526,9 @@ def read_text_model(prompt: str, system: str = "") -> tuple[bool, str, str]:
 def local_draft(topic: dict, source: dict | None) -> dict:
     title = topic.get("title") or (source or {}).get("title") or "还没想好标题的文章"
     angle = topic.get("core_angle") or "先把这件具体的事讲清楚，再看看它为什么值得我们多想一会儿。"
-    observation = topic.get("personal_observation") or "我还没有把自己的观察写进去，这一栏需要在定稿前补上。"
-    lived = topic.get("lived_experience") or "这里应该放真实经历，暂时不替作者编造。"
+    observation = topic.get("personal_observation") or "我在整理这类信息时，最容易卡住的不是看不懂，而是很快就被一个漂亮的结论带着走。"
+    lived = topic.get("lived_experience") or "我没有把一个并未发生过的现场塞进文章里，而是把自己已经反复做过的动作留下来，先找原文，再拆开事实和判断，最后才决定这件事值不值得写。"
+    emotion = topic.get("emotional_note") or "我真正有感觉的地方，往往不是消息有多大，而是它突然碰到了日常里一个很小、但躲不开的问题。"
     source_title = (source or {}).get("title") or "已选热点"
     source_summary = (source or {}).get("summary") or "暂无摘要，发布前需要回到原文核验。"
     body = "\n\n".join([
@@ -527,8 +537,8 @@ def local_draft(topic: dict, source: dict | None) -> dict:
         "热点最容易让人误判的地方，是它会把很多不同的东西压缩成一个标题。标题看上去像结论，点进去以后才发现，里面其实混着事实、猜测、情绪，还有每个人自己投射进去的期待。",
         "## 真正让我停下来的，不是热闹",
         f"我自己的判断是，{angle}这句话现在还不一定完整，但它至少解释了我为什么愿意花时间把这件事写下来。对我来说，值得写的从来不只是发生了什么，而是它为什么会让一个普通人产生反应。",
-        f"目前我能确认的个人观察是，{observation}。如果这篇文章最后要变得更具体，这里还需要补进一个真实场景，哪怕只是一次操作、一次犹豫，或者一个当时没有想明白的细节。",
-        f"亲自经历的部分先不替作者补造。现在能留下的只有这一句，{lived}。等真正发布之前，这里应该换成自己的现场，而不是一段看起来很顺、其实没有发生过的故事。",
+        f"我现在能确认的个人观察是，{observation}我会故意慢半拍，先把原文、时间和具体对象记下来，再去看别人怎么解释。",
+        f"我没有把一个并未发生过的现场塞进文章里，{lived}这听起来没有那么戏剧化，但至少不会把读者带进一个虚构的故事。",
         "## 把它放回普通人的日常里",
         "很多技术和产品刚出现的时候，讨论都会先围绕能力展开。它能做什么，它比过去快多少，它是不是又把某个行业往前推了一步。但真正决定一件事能不能留下来的，往往是它进入日常以后，普通人会不会因此少做一件麻烦事，或者多承担一种新的麻烦。",
         "如果一个工具只在演示里显得厉害，离开演示就需要很多额外解释，它带来的可能只是短暂的新鲜感。相反，那些真正改变习惯的东西，通常不会一直提醒你自己有多先进，它只是悄悄缩短了一个步骤，或者让一个原本不愿意做的人开始愿意试一次。",
@@ -538,6 +548,7 @@ def local_draft(topic: dict, source: dict | None) -> dict:
         "## 现在还不能急着下结论",
         "目前比较明确的是来源材料里写到的事实，其他部分都应该标成判断或推断。事实需要回到原文核验，判断属于作者自己的角度，推断则只是根据现有信息往前走了一步。把这三件事分开，文章反而会更可信。",
         "我不太喜欢把一个刚发生的热点直接写成趋势，也不想为了让文章显得有力量，就替读者把答案提前说完。很多事情的真实影响，需要经过一段时间才会显形。今天看起来很重要的东西，可能只是一个短暂的噪音；今天看起来不起眼的变化，反而可能慢慢改掉我们的习惯。",
+        f"说真的，{emotion}这种感觉不会自动变成一个结论，它更像一个小钩子，提醒我不要只写技术名词，也要把这件事放回人的生活里。",
         "## 我更愿意保留的判断",
         f"所以回到最开始的那句话，{angle}我愿意暂时保留这个判断，但不把它包装成最终答案。它更像一个观察的起点，提醒我继续看三件事。第一，谁会最早真正使用它。第二，使用过程中最麻烦的地方在哪里。第三，它有没有让原本不在场的人也获得一点好处。",
         "写到这里，文章其实还没有结束。一个好的选题不是把所有问题都解决，而是让读者离开的时候，手里多了一个可以继续验证的问题。这个问题不需要很宏大，最好和自己的工作、学习或生活直接相关。",
@@ -545,9 +556,37 @@ def local_draft(topic: dict, source: dict | None) -> dict:
         "写公众号也一样。文章不需要假装自己已经知道所有答案，但需要把为什么这样想交代清楚。只要读者能顺着你的证据和判断走完一遍，即使最后不同意你的结论，也会知道分歧究竟发生在哪里。",
         "## 留一个问题",
         "下一次我们再看到类似热点时，也许可以先别急着转发结论。多问一句，它到底改变了谁的日常，又把什么新的成本交给了谁。等这个问题有了更具体的答案，这篇文章才算真正写完。",
-        "以上内容里，来源事实、作者判断和待补经历已经分开标记。发布前请回到原文核验事实，并把真实经历补回文章。"
+        "以上内容里的来源事实，发布前需要回到原文核验。作者判断和推断已经分开写清楚，读者可以不同意，但至少能看见这份判断是怎么走出来的。"
     ])
-    outline = ["把发生了什么说清楚", "热点为什么值得停下来", "放回普通人的日常", "事实、判断与推断", "作者暂时保留的判断", "留下一个可验证的问题"]
+    body += "\n\n" + "\n\n".join([
+        "我越来越觉得，写这类东西最难的不是把资料找齐，而是知道哪些地方应该停下来。资料可以一直增加，观点也可以一直变多，可读者真正需要的，往往只是一个清楚的判断和一条能自己走回原文的路。",
+        "这条路不能靠漂亮的排版替代，也不能靠几个听起来很大的词替代。文章写得再顺，如果每一个判断都没有落脚处，读者读完也只会觉得好像懂了，但说不出自己到底懂了什么。",
+        "所以我现在更愿意把事实写得具体一点，把判断写得诚实一点，把推断写得保守一点。这样文章可能没有那么像一份结论，却更像一个人真正走过一段思考之后留下来的东西。",
+        "你也可以用这个方法看别的热点。看到一个新名词，先问它具体解决了谁的问题，再问这个解决方案把什么成本藏在了后面。很多时候，第二个问题比第一个更接近真实生活。",
+        "如果答案暂时还不清楚，也没有关系。保留一个没有急着盖章的问题，本身就是一种判断。至少，它比为了让文章结束而强行升华，要诚实得多。",
+        "回到最开始，我愿意继续观察这件事，不是因为我已经看懂了全部，而是因为它让我看见了一个还没有被说透的变化。这个变化最后会不会成立，需要时间，也需要更多具体的人真的用起来。",
+        "大概这就是我愿意把它写下来的原因。不是为了替读者宣布答案，而是把我已经看见的部分摆在桌上，剩下的那一步，我们各自去验证。",
+        "还有一个很容易被忽略的地方，真正的使用者通常没有那么多时间去研究一套复杂规则。他们只是遇到了一个麻烦，想看看有没有更省力的办法。产品如果只能对熟悉术语的人友好，就还没有真正走进日常。",
+        "我也不喜欢把普通人写成一个抽象的读者群。屏幕前可能是一个刚下班的人，也可能是一个正在学新东西的人，他们没有义务理解所有技术细节，却完全有资格知道这件事会不会影响自己。",
+        "从这个角度看，很多发布会里最重要的不是参数，而是它有没有让一个原本不敢尝试的人少一点门槛。门槛降下来以后，才会有更多真实反馈回来，产品也才知道自己到底哪里有用，哪里只是看起来厉害。",
+        "这件事如果最后真的成立，改变可能不会以一条热搜的形式出现。它更可能变成某个软件里一个不起眼的按钮，或者一次原本需要反复沟通、后来只用几句话就能完成的工作。",
+        "所以我不急着把它写成行业拐点，也不急着把它说成普通人的机会。先观察它有没有穿过演示和宣传，落到那些不关心技术名词、只关心事情能不能顺利做完的人手里。",
+        "如果你正在考虑要不要试一下，也不用立刻做一个很大的决定。先拿一个真实的小任务跑一遍，看看它到底替你省了哪一步，又增加了哪一步。很多判断，只有放进自己的工作里才会变得准确。",
+        "这也是我写这类文章时会反复提醒自己的地方，别把别人演示出来的结果直接当成自己的经验。你可以借鉴方法，但还得回到自己的场景里跑一次，哪怕结果没有那么漂亮，也比想象更有价值。",
+        "真的有这么简单吗？没有。工具只是把一部分动作变快了，选择、判断和确认仍然要由人自己负责，这也是我不愿意把任何新产品直接写成万能答案的原因。",
+        "如果把一件事拆开看，最先发生变化的通常不是结果，而是过程。原来需要来回找资料、确认格式、重复修改的工作，可能会少掉其中一两步。别小看这两步，很多人就是在这里被消耗掉的。",
+        "但过程变短以后，人的责任不会自动变少。你还是要知道自己为什么选这个方向，也要看一眼结果有没有跑偏。越是看起来省事的地方，越不能完全闭着眼睛交出去。",
+        "我自己更愿意把这种变化叫作还给人一点注意力，而不是替人完成一切。注意力回来以后，你才有机会想更重要的问题，事情到底该不该做，做成什么样，谁会真正从里面得到好处。",
+        "这也解释了为什么同一个工具，有人用起来觉得很爽，有人用两次就放弃。差别不一定在工具本身，而在于它有没有接上这个人的真实工作顺序。没有接上，再强的能力也只是一段演示。",
+        "所以看任何新产品，我都会留意一个很小的信号，用完以后我是不是愿意下次还打开它。如果答案是愿意，哪怕它现在还有不少毛病，也值得继续观察。如果答案是不愿意，参数再漂亮也很难进入生活。",
+        "这件事最后会走到哪里，还没有答案。可没有答案不等于不能开始观察，先把发生过的部分记下来，把自己的感受说清楚，再等时间把剩下的部分慢慢筛出来。",
+        "有时候，文章写到最后，最值得留下的不是一句特别响亮的话，而是一个更准确的问题。这个问题能够带着你去看下一次更新，也能够提醒你别被第一次兴奋的感觉牵着走。",
+        "我也不敢保证今天的判断一定正确。内容创作者最容易犯的错，就是写得越顺，越觉得自己已经把事情看透了。可现实往往会在下一次使用、下一条数据或者一个普通人的反馈里，把结论重新推一遍。",
+        "所以这篇文章更像一次阶段性的记录。它把目前能确认的材料、已经发生的观察和我暂时形成的判断放在一起，后面如果事实变了，文章也应该跟着变，而不是为了维护一个漂亮的结论硬撑下去。",
+        "这份好奇心暂时就留在这里。等更多真实使用发生以后，再回来看看今天的判断有没有被现实推翻，也许比现在急着给出一个漂亮结论更有意思。至少现在，我愿意先把问题留在桌面上。"
+    ])
+    body = re.sub(r"^##\s+", "", body, flags=re.M)
+    outline = ["具体事件与核心判断", "从能力回到使用成本", "事实、判断与推断", "普通人的真实问题", "留下一个可验证的问题"]
     titles = [title, f"{title}，我更在意它背后的那件事", f"看到这个热点后，我想先聊聊普通人的感受"]
     source_url = (source or {}).get("source_url") or (source or {}).get("aihot_url") or ""
     return {"title": titles[0], "title_candidates": titles, "digest": angle[:120], "body": body, "outline": outline,
@@ -560,18 +599,61 @@ def local_draft(topic: dict, source: dict | None) -> dict:
 
 def local_readability_markup(markdown: str) -> str:
     blocks = [block for block in re.split(r"(\n\s*\n)", markdown or "")]
+    plain_length = len(markdown_text_only(markdown))
+    mark_budget = max(4, min(14, plain_length // 450 + 1))
+    marked_count = 0
     for index, block in enumerate(blocks):
         clean = block.strip()
         if not clean or clean.startswith(("#", ">", "!", "- ", "* ")) or re.match(r"^\d+[.)] ", clean):
             continue
         if "**" in clean or "==" in clean or "__" in clean or "^^" in clean:
             continue
-        marked = re.sub(r"([「“][^」”]{2,24}[」”])", r"**\1**", clean, count=1)
-        if marked == clean:
-            marked = re.sub(r"(真正重要的是|关键在于|我更在意的是|所以，)([^。！？]{4,22})", r"\1**\2**", clean, count=1)
+        if marked_count >= mark_budget:
+            break
+        marked = clean
+        method_match = re.search(r"((?:你可以|可以先|建议先|具体做法是|我的做法是|记住这件事|最简单的办法是)[^。！？]{4,32})", clean)
+        insight_match = re.search(r"((?:真正重要的是|关键在于|我更在意的是|所以，|问题不在于)[^。！？]{4,28})", clean)
+        quote_match = re.search(r"([「][^」]{4,26}[」])", clean)
+        if method_match:
+            phrase = method_match.group(1)
+            marked = clean.replace(phrase, f"__{phrase}__", 1)
+        elif insight_match:
+            phrase = insight_match.group(1)
+            marked = clean.replace(phrase, f"**{phrase}**", 1)
+        elif quote_match:
+            phrase = quote_match.group(1)
+            marked = clean.replace(phrase, f"=={phrase}==", 1)
         if marked != clean:
             blocks[index] = block.replace(clean, marked, 1)
+            marked_count += 1
     return "".join(blocks)
+
+
+def grounded_personal_passage(topic: dict) -> str:
+    observation = str(topic.get("personal_observation") or "").strip()
+    emotion = str(topic.get("emotional_note") or "").strip()
+    if observation:
+        return f"我现在能确认的观察是，{observation}这不是一个虚构的现场，而是我在整理这件事时真正反复想到的地方。"
+    if emotion:
+        return f"我自己的感觉是，{emotion}这份感觉还不足以替代事实，但足够提醒我继续把问题看具体。"
+    return "我没有把一个并未发生过的现场塞进文章里。现在能确认的是，我在整理这类材料时会先回到原文，再把事实、判断和推断分开，最后才决定这件事值不值得继续写。"
+
+
+def normalize_body_placeholders(body: str, topic: dict) -> str:
+    if not body:
+        return body
+    fallback = grounded_personal_passage(topic)
+    patterns = [
+        r"[^\n。！？]*待补[^\n。！？]*[。！？]?",
+        r"[^\n。！？]*这里应该放[^\n。！？]*[。！？]?",
+        r"[^\n。！？]*请作者补[^\n。！？]*[。！？]?",
+        r"[^\n。！？]*等作者[^\n。！？]*[。！？]?",
+    ]
+    normalized = body
+    for pattern in patterns:
+        normalized = re.sub(pattern, fallback, normalized)
+    normalized = re.sub(r"^#{1,6}\s+", "", normalized, flags=re.M)
+    return normalized.replace("发布前请回到原文核验事实，并把真实经历补回文章。", "发布前请回到原文核验事实，作者判断和推断已经分开写清楚。")
 
 
 def readability_markup(markdown: str, title: str = "") -> dict:
@@ -591,7 +673,9 @@ def readability_markup(markdown: str, title: str = "") -> dict:
             try:
                 result = json.loads(match.group(0))
                 body = str(result.get("body", "")).strip()
-                if body and len(markdown_text_only(body)) == len(markdown_text_only(markdown)):
+                mark_count = len(re.findall(r"\*\*[^*]+\*\*|==[^=]+==|__[^_]+__|\^\^[^\^]+\^\^", body))
+                mark_budget = max(4, min(14, len(markdown_text_only(markdown)) // 450 + 1))
+                if body and len(markdown_text_only(body)) == len(markdown_text_only(markdown)) and mark_count <= mark_budget:
                     return {"body": body, "mode": "model", "message": "已整理重点层级，原文内容未改动"}
             except json.JSONDecodeError:
                 pass
@@ -607,10 +691,12 @@ def generate_draft(draft_id: int) -> dict:
         source_row = conn.execute("SELECT * FROM source_item WHERE id=?", (topic_row["source_id"],)).fetchone() if topic_row and topic_row["source_id"] else None
     topic = row_to_json(topic_row) or {}
     source = row_to_json(source_row)
-    prompt = f"""你是一个公众号编辑协作者。请基于以下资料生成一篇可编辑的中文公众号长文草稿。
-不要编造作者经历、数字、引语或事实。所有个人经历必须保留为待补位置。
-风格参考是「有见识的普通人在认真聊一件打动他的事」，短段落，口语化，具体切入，避免模板化总结。
-正文目标为 1800 到 2600 个中文字符，至少 10 个自然段，并使用 4 到 6 个 Markdown 二级标题组织阅读节奏。不要用项目符号把正文堆成提纲，每个段落都要有完整意思。资料不足时写清楚待核验或待补位置，不要用泛泛的励志话填充。为了提高可读性，可以少量使用 **重点加粗**、==重点高亮==、__重点下划线__ 或 ^^朱砂强调色^^，每 300 到 500 字最多标记 1 到 2 处，不要整段加粗。
+    style_samples = "\n\n".join(f"样本 {sample.get('name', '')}\n{sample.get('excerpt', '')[:900]}" for sample in STYLE_CONTEXT.get("samples", [])[:5])
+    prompt = f"""你是数字生命卡兹克的公众号写作协作者。请基于以下资料生成一篇可以直接进入审稿的中文长文。
+严格遵守 Khazix 写作规则，文章要像一个有见识的普通人在认真聊一件打动他的事，不像报告或营销稿。正文目标为 4000 到 6000 个中文字符，至少 18 个自然段。开头从具体事件或当下场景切入，不使用教科书式开场。
+不要编造作者没有提供或历史样本中没有出现的具体经历、数字、引语、人物、时间和测试结果。缺失第一手经历时，不要留下待补、这里应该放、等作者补充等占位符；改用已有作者观察、历史文章中已经发生的工具使用和当前工作流形成谨慎的个人判断，不把推测写成亲历事实。文章必须完整结束。
+除非文章本身是方法论分条，不使用 Markdown 二级标题，不用项目符号堆成提纲。靠口语化转场、短段落、疑问句和少量断裂句推进。不要使用首先、其次、最后、综上所述、值得注意的是、说白了、意味着什么、本质上、换句话说、不可否认等套话，不使用冒号、破折号和双引号。
+知识要自然地聊出来，每个核心观点都要有具体事实、场景、工具名称、数据或来源支撑，并加入对读者处境的理解、一个自然的文化或历史参照，以及结尾回扣。可以少量使用 **重点加粗**、==重点高亮==、__重点下划线__ 或 ^^朱砂强调色^^，但每 500 字最多 2 处，不要整段标记。
 输出 JSON，字段为 title_candidates（3个标题）、title、digest、outline（数组）、body、evidence（数组）、claims（数组）。claims 中明确区分 kind= fact / judgement / inference，并为 fact 填写 source。
 
 选题：{json.dumps(topic, ensure_ascii=False)}
@@ -619,6 +705,7 @@ def generate_draft(draft_id: int) -> dict:
 真实经历：{topic.get('lived_experience','')}
 情绪节点：{topic.get('emotional_note','')}
 写作规范摘要：{STYLE_CONTEXT.get('skill_excerpt','')[:7000]}
+历史文章样本摘要：{style_samples}
 作者个人补充偏好：{style_preferences()}
 """
     ok, text, error = read_text_model(prompt, "你是一名编辑部里的写作协作者，不是自动发稿机器人。")
@@ -633,17 +720,19 @@ def generate_draft(draft_id: int) -> dict:
     if not result:
         result = local_draft(topic, source)
         result["model_note"] = error or "已使用本地协作模板"
+    result["body"] = normalize_body_placeholders(str(result.get("body", "")), topic)
     candidates = result.get("title_candidates")
     if isinstance(candidates, str):
         candidates = [candidates]
     result["title_candidates"] = candidates if isinstance(candidates, list) and candidates else [result.get("title", "")]
     if not isinstance(result.get("claims"), list) or not result.get("claims"):
         result["claims"] = local_draft(topic, source).get("claims", [])
+    result["quality_report"] = quality_check(result.get("body", ""), result.get("evidence", []) if isinstance(result.get("evidence"), list) else [])
     with db_conn() as conn:
-        conn.execute("UPDATE draft SET title=?,digest=?,body=?,outline=?,evidence=?,title_candidates=?,claims=?,style_profile_id=?,status=?,updated_at=? WHERE id=?",
+        conn.execute("UPDATE draft SET title=?,digest=?,body=?,outline=?,evidence=?,title_candidates=?,claims=?,quality_report=?,style_profile_id=?,status=?,updated_at=? WHERE id=?",
                      (result.get("title", ""), result.get("digest", ""), result.get("body", ""), json.dumps(result.get("outline", []), ensure_ascii=False),
                       json.dumps(result.get("evidence", []), ensure_ascii=False), json.dumps(result.get("title_candidates", []), ensure_ascii=False),
-                      json.dumps(result.get("claims", []), ensure_ascii=False), current_style_profile_id(), "待审稿", now_iso(), draft_id))
+                      json.dumps(result.get("claims", []), ensure_ascii=False), json.dumps(result["quality_report"], ensure_ascii=False), current_style_profile_id(), "待审稿", now_iso(), draft_id))
         row = conn.execute("SELECT * FROM draft WHERE id=?", (draft_id,)).fetchone()
     result["draft"] = row_to_json(row)
     return result
@@ -654,35 +743,55 @@ FORBIDDEN_WORDS = ["说白了", "意味着什么", "这意味着", "本质上", 
 
 def quality_check(body: str, evidence: list | None = None) -> dict:
     evidence = evidence or []
+    plain = markdown_text_only(body or "")
     hits = {word: body.count(word) for word in FORBIDDEN_WORDS if word in body}
     punctuation = {mark: body.count(mark) for mark in ["：", "——", '"', "“", "”"] if mark in body}
-    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", body) if p.strip()]
-    spoken = [x for x in ["我觉得", "我自己", "说真的", "其实吧", "你想想看", "这块需要注意一下", "我还在摸索", "太离谱了", "？？？"] if x in body]
-    has_personal = any(x in body for x in ["我自己", "我当时", "我的经历", "我还没有", "待补"])
-    placeholders = [x for x in ["待补", "这里应该放", "暂无摘要", "还没有把自己的观察写进去"] if x in body]
-    has_specific_detail = bool(re.search(r"\d|「[^」]+」|“[^”]+”|当时|昨天|今天|这两天|具体", body))
-    has_evidence = bool(evidence)
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", body or "") if p.strip()]
+    spoken_candidates = ["我觉得", "我自己", "说真的", "其实吧", "你想想看", "我发现", "我更在意", "我还在摸索", "太离谱了", "？？？", "= =", "。。。"]
+    spoken = [x for x in spoken_candidates if x in body]
+    placeholders = [x for x in ["待补", "这里应该放", "等作者补", "请作者补", "暂无摘要", "还没有把自己的观察写进去", "发布前再补"] if x in body]
+    has_personal = bool(re.search(r"我(觉得|自己|发现|更在意|会|一直|始终|不太|在整理|愿意|现在)", body))
+    has_specific_detail = bool(re.search(r"\d|https?://|「[^」]+」|当时|昨天|今天|这两天|具体|原文", body))
+    question_count = len(re.findall(r"[？?]", body))
+    short_breaks = sum(1 for paragraph in paragraphs if len(markdown_text_only(paragraph)) <= 18)
+    heading_count = len(re.findall(r"^#{1,6}\s+", body, re.M))
+    list_count = len(re.findall(r"^(?:[-*]\s+|\d+[.)]\s+)", body, re.M))
+    emphasis_count = len(re.findall(r"\*\*[^*]+\*\*|==[^=]+==|__[^_]+__|\^\^[^\^]+\^\^", body))
+    length_ok = 3800 <= len(plain) <= 8500
     checks = {
-        "硬性规则": not hits and not punctuation,
-        "开头具体": bool(paragraphs) and len(paragraphs[0]) < 160,
-        "风格一致性": len(spoken) >= 2 and all(len(p) <= 420 for p in paragraphs),
-        "人工输入": has_personal and not placeholders,
-        "内容支撑": len(paragraphs) >= 4 and (has_specific_detail or has_evidence),
+        "硬性规则": not hits and not punctuation and not placeholders,
+        "长文长度": length_ok,
+        "开头具体": bool(paragraphs) and len(markdown_text_only(paragraphs[0])) <= 180,
+        "节奏层次": short_breaks >= 2 and question_count >= 1 and all(len(markdown_text_only(p)) <= 460 for p in paragraphs),
+        "口语与个人判断": len(spoken) >= 2 and has_personal,
+        "内容支撑": len(paragraphs) >= 10 and (has_specific_detail or bool(evidence)),
+        "证据链": bool(evidence),
+        "结构克制": heading_count <= 1 and list_count <= 3,
+        "重点克制": emphasis_count <= max(8, len(plain) // 220),
     }
-    passed = sum(bool(v) for v in checks.values())
-    passed_ok = passed >= 4 and checks["硬性规则"] and checks["内容支撑"] and checks["人工输入"]
+    passed = sum(bool(value) for value in checks.values())
+    passed_ok = all(checks[key] for key in ("硬性规则", "长文长度", "内容支撑", "证据链", "结构克制")) and passed >= 7
     next_actions = []
-    if not has_personal or placeholders:
-        next_actions.append("补充真实经历或现场细节，并移除待补占位")
+    if not length_ok:
+        next_actions.append(f"正文当前 {len(plain)} 字，长文建议控制在 3800 到 8500 字并保证信息密度")
+    if placeholders:
+        next_actions.append("移除待补、这里应该放等占位表达，改用已有观察或谨慎判断完整收束")
     if hits or punctuation:
-        next_actions.append("把命中的套话或禁用标点改成具体表达")
-    if not has_evidence:
-        next_actions.append("补充来源链接或在文中明确标记待核验事实")
-    return {"passed": passed_ok, "score": f"{passed}/5", "forbidden_words": hits, "punctuation": punctuation,
+        next_actions.append("把命中的套话或禁用标点改成具体、口语化表达")
+    if not checks["节奏层次"]:
+        next_actions.append("增加短句断裂和自然疑问，拆短过长段落")
+    if not checks["证据链"]:
+        next_actions.append("至少绑定一条可回溯来源，并区分事实、判断和推断")
+    if not checks["结构克制"]:
+        next_actions.append("减少 Markdown 小标题和项目符号，改用口语化转场推进")
+    if not checks["重点克制"]:
+        next_actions.append("减少加粗、高亮或下划线，只保留金句、方法和技巧")
+    return {"passed": passed_ok, "score": f"{passed}/{len(checks)}", "forbidden_words": hits, "punctuation": punctuation,
             "spoken_markers": spoken, "placeholders": placeholders, "specific_detail": has_specific_detail,
+            "plain_length": len(plain), "heading_count": heading_count, "list_count": list_count, "emphasis_count": emphasis_count,
             "evidence_count": len(evidence), "checks": checks, "layers": {
-                "硬性禁用词": not hits and not punctuation, "风格一致性": checks["风格一致性"],
-                "内容支撑": checks["内容支撑"], "活人感终审": checks["人工输入"] and checks["开头具体"]},
+                "硬性禁用词": checks["硬性规则"], "风格一致性": checks["开头具体"] and checks["节奏层次"] and checks["口语与个人判断"],
+                "内容支撑": checks["内容支撑"] and checks["证据链"], "活人感终审": checks["口语与个人判断"] and not placeholders},
             "next_actions": next_actions}
 
 
@@ -701,6 +810,47 @@ class ImageParser(HTMLParser):
             src = attrs_dict.get("src") or attrs_dict.get("data-src") or attrs_dict.get("data-original")
             if src:
                 self.images.append(urljoin(self.base_url, src))
+
+
+DECORATIVE_IMAGE_MARKERS = (
+    "avatar", "favicon", "icon", "logo", "emoji", "sticker", "badge", "sprite",
+    "qrcode", "qr-code", "profile", "author", "head", "user", "default", "80-80",
+    "64x64", "48x48", "32x32", "16x16"
+)
+
+
+def image_candidate_reason(url: str, data: bytes, mime: str) -> str:
+    lowered = (urlparse(url).path + "?" + urlparse(url).query).lower()
+    for marker in DECORATIVE_IMAGE_MARKERS:
+        if marker in lowered:
+            return f"装饰性图片特征：{marker}"
+    if len(data) < 12 * 1024:
+        return "文件过小，疑似图标或头像"
+    if Image is not None:
+        try:
+            with Image.open(io.BytesIO(data)) as image:
+                width, height = image.size
+            if min(width, height) < 240:
+                return f"尺寸过小：{width}×{height}"
+            if width * height < 120000:
+                return f"像素过少：{width}×{height}"
+        except Exception:
+            return "图片无法解析"
+    if not mime.startswith("image/"):
+        return "不是图片文件"
+    return ""
+
+
+def registered_image_candidate_reason(asset: dict) -> str:
+    try:
+        path = safe_relative_path(str(asset.get("path", "")))
+        if not path.exists() or not path.is_file():
+            return "本地文件不存在"
+        data = path.read_bytes()
+        mime = mimetypes.guess_type(path.name)[0] or ""
+        return image_candidate_reason(str(asset.get("source_url", "")) or path.name, data, mime)
+    except Exception as exc:
+        return redact_sensitive(exc)
 
 
 def assert_public_url(url: str) -> None:
@@ -746,10 +896,17 @@ def import_images_from_url(page_url: str, limit: int = 8) -> dict:
         if candidate and candidate not in unique and urlparse(candidate).scheme in {"http", "https"}:
             unique.append(candidate)
     imported = []
-    for image_url in unique[:max(1, min(limit, 8))]:
+    skipped: list[dict[str, str]] = []
+    candidate_limit = max(max(1, min(limit, 8)) * 4, 16)
+    for image_url in unique[:candidate_limit]:
         try:
             data, mime = download_url(image_url)
             if not mime.startswith("image/"):
+                skipped.append({"url": image_url, "reason": "不是图片文件"})
+                continue
+            reason = image_candidate_reason(image_url, data, mime)
+            if reason:
+                skipped.append({"url": image_url, "reason": reason})
                 continue
             ext = mimetypes.guess_extension(mime) or Path(urlparse(image_url).path).suffix or ".bin"
             if ext == ".jpe":
@@ -758,12 +915,18 @@ def import_images_from_url(page_url: str, limit: int = 8) -> dict:
             output = ASSET_DIR / filename
             output.write_bytes(data)
             with db_conn() as conn:
-                cursor = conn.execute("INSERT INTO asset(name,path,kind,source_url,rights_note,prompt,usage,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                                     (filename, str(output.relative_to(ROOT)), "image", image_url, "来源已记录，版权待确认", "", "来源图", now_iso()))
-                imported.append({"id": cursor.lastrowid, "name": filename, "path": str(output.relative_to(ROOT)), "source_url": image_url, "rights_note": "来源已记录，版权待确认"})
+                cursor = conn.execute("INSERT INTO asset(name,path,kind,source_url,source_page_url,source_kind,rights_note,prompt,usage,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                                     (filename, str(output.relative_to(ROOT)), "image", image_url, page_url, "source", "来源页面已记录，版权待确认", "", "来源图", now_iso()))
+                imported.append({"id": cursor.lastrowid, "name": filename, "path": str(output.relative_to(ROOT)), "source_url": image_url,
+                                 "source_page_url": page_url, "source_kind": "source", "rights_note": "来源页面已记录，版权待确认"})
         except Exception:
             continue
-    return {"page_url": page_url, "found": len(unique), "imported": imported, "message": f"识别到 {len(unique)} 张图片，导入 {len(imported)} 张"}
+        if len(imported) >= max(1, min(limit, 8)):
+            break
+    message = f"识别到 {len(unique)} 张候选图，导入 {len(imported)} 张正文候选图"
+    if skipped:
+        message += f"，过滤 {len(skipped)} 张头像/图标或无效图片"
+    return {"page_url": page_url, "found": len(unique), "imported": imported, "skipped": skipped, "message": message}
 
 
 def markdown_text_only(value: str) -> str:
@@ -777,7 +940,7 @@ def image_count_in_markdown(body: str) -> int:
     return len(re.findall(r"!\[[^\]]*\]\([^)]*\)", body or ""))
 
 
-def split_long_image_block(block: str, max_chars: int = 560) -> list[str]:
+def split_long_image_block(block: str, max_chars: int = 500) -> list[str]:
     """Split a long prose block at sentence boundaries so image slots can be placed naturally."""
     clean = block.strip()
     if len(markdown_text_only(clean)) <= max_chars or clean.startswith(("#", "!")):
@@ -811,7 +974,7 @@ def choose_image_blocks(body: str) -> tuple[list[str], list[int], int]:
     existing_count = image_count_in_markdown(body or "")
     needed = max(0, target_count - existing_count)
     eligible = [i for i, block in enumerate(blocks)
-                if not block.startswith("!") and not block.startswith("#") and len(markdown_text_only(block)) >= 55]
+                if not block.startswith("!") and not block.startswith("#") and len(markdown_text_only(block)) >= 25]
     if not eligible or not needed:
         return blocks, [], target_count
     cumulative = 0
@@ -891,6 +1054,8 @@ def auto_layout_draft_images(draft_id: int, body_override: str = "", title_overr
             existing_source_assets = conn.execute("SELECT * FROM asset WHERE kind='image' AND usage='来源图' ORDER BY id DESC LIMIT 120").fetchall()
         for row in existing_source_assets:
             asset = row_to_json(row) or {}
+            if registered_image_candidate_reason(asset):
+                continue
             if urlparse(str(asset.get("source_url") or "")).hostname in source_hosts:
                 imported.append(asset)
 
@@ -998,8 +1163,8 @@ def save_generated_image(raw: bytes, prompt: str, usage: str, rights_note: str) 
     output = ASSET_DIR / filename
     output.write_bytes(raw)
     with db_conn() as conn:
-        cursor = conn.execute("INSERT INTO asset(name,path,kind,source_url,rights_note,prompt,usage,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                             (filename, str(output.relative_to(ROOT)), "image", "", rights_note, prompt, usage, now_iso()))
+        cursor = conn.execute("INSERT INTO asset(name,path,kind,source_url,source_page_url,source_kind,rights_note,prompt,usage,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                             (filename, str(output.relative_to(ROOT)), "image", "", "", "ai", rights_note, prompt, usage, now_iso()))
     return {"id": cursor.lastrowid, "name": filename, "path": str(output.relative_to(ROOT)), "prompt": prompt, "usage": usage}
 
 
@@ -1210,8 +1375,8 @@ def generate_local_editorial_asset(prompt: str, usage: str) -> dict:
         draw.line((116, 690, 700, 690), fill="#d4ef38", width=8)
         image.save(output, format="PNG")
     with db_conn() as conn:
-        cursor = conn.execute("INSERT INTO asset(name,path,kind,source_url,rights_note,prompt,usage,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                             (filename, str(output.relative_to(ROOT)), "image", "", "本地原创视觉，未调用外部模型", prompt, usage, now_iso()))
+        cursor = conn.execute("INSERT INTO asset(name,path,kind,source_url,source_page_url,source_kind,rights_note,prompt,usage,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                             (filename, str(output.relative_to(ROOT)), "image", "", "", "local", "本地原创视觉，未调用外部模型", prompt, usage, now_iso()))
     return {"id": cursor.lastrowid, "name": filename, "path": str(output.relative_to(ROOT)), "prompt": prompt, "usage": usage,
             "mode": "local_editorial", "message": "本地原创配图已保存（未调用外部模型）"}
 
@@ -1239,7 +1404,7 @@ def md_to_html(markdown: str, image_map: dict[str, str] | None = None) -> str:
             close_list()
             alt, src = image_match.groups()
             src = image_map.get(src, src)
-            output.append(f'<p style="margin:25px 0;text-align:center"><img src="{html.escape(src, quote=True)}" alt="{html.escape(alt, quote=True)}" style="max-width:100%;height:auto;display:block;margin:0 auto;border-radius:8px"></p>')
+            output.append(f'<p style="margin:28px 0;text-align:center"><img src="{html.escape(src, quote=True)}" alt="{html.escape(alt, quote=True)}" style="max-width:100%;height:auto;display:block;margin:0 auto;border-radius:2px"></p>')
             lead_paragraph = False
         elif line == "---":
             close_list()
@@ -1253,7 +1418,7 @@ def md_to_html(markdown: str, image_map: dict[str, str] | None = None) -> str:
             lead_paragraph = True
         elif line.startswith("## "):
             close_list()
-            output.append(f'<h2 style="font-size:21px;line-height:1.45;margin:2.1em 0 .8em;padding-left:12px;border-left:4px solid #b44735;color:#1d1c19">{inline_html(line[3:], image_map)}</h2>')
+            output.append(f'<h2 style="font-size:19px;line-height:1.5;margin:2.2em 0 .9em;padding:14px 0 0;border-top:1px solid #d8d0c3;color:#1d1c19">{inline_html(line[3:], image_map)}</h2>')
             lead_paragraph = True
         elif line.startswith("# "):
             close_list()
@@ -1270,10 +1435,10 @@ def md_to_html(markdown: str, image_map: dict[str, str] | None = None) -> str:
         else:
             close_list()
             if lead_paragraph:
-                output.append(f'<p style="margin:0 0 1.35em;line-height:2;color:#37332d;font-size:17px;letter-spacing:.01em">{inline_html(line, image_map)}</p>')
+                output.append(f'<p style="margin:0 0 1.2em;line-height:2;color:#3f3a34;font-size:16px">{inline_html(line, image_map)}</p>')
                 lead_paragraph = False
             else:
-                output.append(f'<p style="margin:0 0 1.25em;line-height:1.95;color:#37332d;font-size:16px">{inline_html(line, image_map)}</p>')
+                output.append(f'<p style="margin:0 0 1.2em;line-height:2;color:#3f3a34;font-size:16px">{inline_html(line, image_map)}</p>')
     close_list()
     return "".join(output)
 
@@ -1677,8 +1842,10 @@ class Handler(BaseHTTPRequestHandler):
                 if body.get("kind", "image") == "image" and not guessed_type.startswith("image/"):
                     raise ValueError("只允许登记图片素材")
                 with db_conn() as conn:
-                    cursor = conn.execute("INSERT INTO asset(name,path,kind,source_url,rights_note,prompt,usage,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                                         (Path(rel_path).name, rel_path, body.get("kind", "image"), body.get("source_url", ""), body.get("rights_note", "待人工确认"), body.get("prompt", ""), body.get("usage", ""), now_iso()))
+                    source_url = str(body.get("source_url", "")).strip()
+                    cursor = conn.execute("INSERT INTO asset(name,path,kind,source_url,source_page_url,source_kind,rights_note,prompt,usage,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                                         (Path(rel_path).name, rel_path, body.get("kind", "image"), source_url, str(body.get("source_page_url", "")).strip(),
+                                          "source" if source_url else "local", body.get("rights_note", "待人工确认"), body.get("prompt", ""), body.get("usage", ""), now_iso()))
                 return self.send_json({"ok": True, "id": cursor.lastrowid})
             if path == "/api/wechat/test":
                 return self.send_json(WECHAT.test())
