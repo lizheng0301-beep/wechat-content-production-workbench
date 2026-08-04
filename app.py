@@ -58,6 +58,11 @@ AIHOT_BASE = "https://aihot.virxact.com/api/v1"
 USER_AGENT = "EditorialWorkbench/1.0 (+local)"
 AUTO_IMAGE_JOBS: dict[str, dict] = {}
 AUTO_IMAGE_JOBS_LOCK = threading.Lock()
+LENGTH_PRESETS = {
+    "compact": {"label": "精简 · 1200–1800 字", "minimum": 1200, "maximum": 1800},
+    "standard": {"label": "标准 · 2200–3200 字", "minimum": 2200, "maximum": 3200},
+    "deep": {"label": "深度 · 3500–5000 字", "minimum": 3500, "maximum": 5000},
+}
 
 
 def now_iso() -> str:
@@ -141,6 +146,7 @@ def init_db() -> None:
               evidence TEXT DEFAULT '[]',
               title_candidates TEXT DEFAULT '[]',
               claims TEXT DEFAULT '[]',
+              length_preset TEXT DEFAULT 'standard',
               style_profile_id INTEGER,
               quality_report TEXT DEFAULT '{}',
               status TEXT DEFAULT '写作中',
@@ -196,7 +202,7 @@ def init_db() -> None:
             """
         )
         draft_columns = {row[1] for row in conn.execute("PRAGMA table_info(draft)").fetchall()}
-        for column, definition in (("title_candidates", "TEXT DEFAULT '[]'"), ("claims", "TEXT DEFAULT '[]'"), ("style_profile_id", "INTEGER")):
+        for column, definition in (("title_candidates", "TEXT DEFAULT '[]'"), ("claims", "TEXT DEFAULT '[]'"), ("length_preset", "TEXT DEFAULT 'standard'"), ("style_profile_id", "INTEGER")):
             if column not in draft_columns:
                 conn.execute(f"ALTER TABLE draft ADD COLUMN {column} {definition}")
         asset_columns = {row[1] for row in conn.execute("PRAGMA table_info(asset)").fetchall()}
@@ -507,6 +513,47 @@ def get_drafts(limit: int = 50) -> list[dict]:
         return [row_to_json(row) for row in rows]
 
 
+def normalize_length_preset(value: object) -> str:
+    candidate = str(value or "standard").strip().lower()
+    return candidate if candidate in LENGTH_PRESETS else "standard"
+
+
+def length_config(value: object) -> dict:
+    return LENGTH_PRESETS[normalize_length_preset(value)]
+
+
+def normalize_markdown_blocks(body: str) -> str:
+    """Make paragraph boundaries explicit so preview and WeChat HTML do not stack prose."""
+    blocks: list[str] = []
+    for line in (body or "").replace("\r\n", "\n").split("\n"):
+        clean = line.strip()
+        if not clean:
+            continue
+        blocks.append(clean)
+    return "\n\n".join(blocks)
+
+
+def trim_body_to_budget(body: str, length_preset: str = "standard") -> str:
+    config = length_config(length_preset)
+    if len(markdown_text_only(body)) <= config["maximum"]:
+        return body
+    blocks = [block.strip() for block in re.split(r"\n\s*\n", body or "") if block.strip()]
+    if not blocks:
+        return body
+    kept: list[str] = []
+    used = 0
+    for block in blocks:
+        size = len(markdown_text_only(block))
+        if kept and used + size > config["maximum"] - 70:
+            break
+        kept.append(block)
+        used += size
+    closing = "我先把问题留在这里，后面用真实使用继续验证。"
+    if closing not in kept and used + len(closing) <= config["maximum"]:
+        kept.append(closing)
+    return "\n\n".join(kept)
+
+
 def read_text_model(prompt: str, system: str = "") -> tuple[bool, str, str]:
     api_key = os.getenv("OPENAI_API_KEY", "") or os.getenv("DEEPSEEK_API_KEY", "")
     if not api_key:
@@ -527,7 +574,7 @@ def read_text_model(prompt: str, system: str = "") -> tuple[bool, str, str]:
     return False, "", data.get("error", {}).get("message", "模型请求失败") if isinstance(data.get("error"), dict) else str(data.get("error", "模型请求失败"))
 
 
-def local_draft(topic: dict, source: dict | None) -> dict:
+def local_draft(topic: dict, source: dict | None, length_preset: str = "standard") -> dict:
     title = topic.get("title") or (source or {}).get("title") or "还没想好标题的文章"
     angle = topic.get("core_angle") or "先把这件具体的事讲清楚，再看看它为什么值得我们多想一会儿。"
     observation = topic.get("personal_observation") or "我在整理这类信息时，最容易卡住的不是看不懂，而是很快就被一个漂亮的结论带着走。"
@@ -590,6 +637,8 @@ def local_draft(topic: dict, source: dict | None) -> dict:
         "这份好奇心暂时就留在这里。等更多真实使用发生以后，再回来看看今天的判断有没有被现实推翻，也许比现在急着给出一个漂亮结论更有意思。至少现在，我愿意先把问题留在桌面上。"
     ])
     body = re.sub(r"^##\s+", "", body, flags=re.M)
+    body = normalize_markdown_blocks(body)
+    body = trim_body_to_budget(body, length_preset)
     outline = ["具体事件与核心判断", "从能力回到使用成本", "事实、判断与推断", "普通人的真实问题", "留下一个可验证的问题"]
     titles = [title, f"{title}，我更在意它背后的那件事", f"看到这个热点后，我想先聊聊普通人的感受"]
     source_url = (source or {}).get("source_url") or (source or {}).get("aihot_url") or ""
@@ -598,39 +647,46 @@ def local_draft(topic: dict, source: dict | None) -> dict:
             "claims": [{"kind": "fact", "text": source_summary, "source": source_url},
                        {"kind": "judgement", "text": angle, "source": "作者核心判断"},
                        {"kind": "inference", "text": "这件事可能会改变普通人的日常工作方式，发布前需人工核验。", "source": "作者推断"}],
-            "mode": "local_template"}
+            "mode": "local_template", "length_preset": normalize_length_preset(length_preset)}
 
 
 def local_readability_markup(markdown: str) -> str:
-    blocks = [block for block in re.split(r"(\n\s*\n)", markdown or "")]
+    blocks = [block.strip() for block in re.split(r"\n\s*\n", markdown or "") if block.strip()]
     plain_length = len(markdown_text_only(markdown))
-    mark_budget = max(4, min(14, plain_length // 450 + 1))
-    marked_count = 0
+    mark_budget = max(4, min(10, plain_length // 400 + 1))
+    candidates: list[tuple[int, int, str, str]] = []
     for index, block in enumerate(blocks):
-        clean = block.strip()
-        if not clean or clean.startswith(("#", ">", "!", "- ", "* ")) or re.match(r"^\d+[.)] ", clean):
+        if block.startswith(("#", ">", "!", "- ", "* ")) or re.match(r"^\d+[.)] ", block):
             continue
-        if "**" in clean or "==" in clean or "__" in clean or "^^" in clean:
+        if any(token in block for token in ("**", "==", "__", "^^")):
             continue
-        if marked_count >= mark_budget:
+        sentences = [item.strip() for item in re.split(r"(?<=[。！？!?])", block) if item.strip()]
+        for sentence in sentences:
+            plain_sentence = markdown_text_only(sentence)
+            if not 8 <= len(plain_sentence) <= 55:
+                continue
+            if re.search(r"(?:你可以|可以先|建议先|具体做法|我的做法|记住|最简单的办法|先[^。！？]{1,12}再)", sentence):
+                candidates.append((index, 4, "__", sentence))
+            elif re.search(r"(?:真正重要|关键在于|我更在意|问题不在|我自己的判断|所以，)", sentence):
+                candidates.append((index, 3, "**", sentence))
+            elif re.search(r"(?:不要|别急|需要注意|风险|小心|不能完全)", sentence):
+                candidates.append((index, 2, "^^", sentence))
+            elif "「" in sentence and "」" in sentence:
+                candidates.append((index, 1, "==", sentence))
+    candidates.sort(key=lambda item: (-item[1], item[0]))
+    selected: list[tuple[int, str, str]] = []
+    used_blocks: set[int] = set()
+    for index, _, marker, sentence in candidates:
+        if len(selected) >= mark_budget:
             break
-        marked = clean
-        method_match = re.search(r"((?:你可以|可以先|建议先|具体做法是|我的做法是|记住这件事|最简单的办法是)[^。！？]{4,32})", clean)
-        insight_match = re.search(r"((?:真正重要的是|关键在于|我更在意的是|所以，|问题不在于)[^。！？]{4,28})", clean)
-        quote_match = re.search(r"([「][^」]{4,26}[」])", clean)
-        if method_match:
-            phrase = method_match.group(1)
-            marked = clean.replace(phrase, f"__{phrase}__", 1)
-        elif insight_match:
-            phrase = insight_match.group(1)
-            marked = clean.replace(phrase, f"**{phrase}**", 1)
-        elif quote_match:
-            phrase = quote_match.group(1)
-            marked = clean.replace(phrase, f"=={phrase}==", 1)
-        if marked != clean:
-            blocks[index] = block.replace(clean, marked, 1)
-            marked_count += 1
-    return "".join(blocks)
+        if index in used_blocks and len(selected) < mark_budget - 2:
+            continue
+        selected.append((index, marker, sentence))
+        used_blocks.add(index)
+    for index, marker, sentence in sorted(selected, key=lambda item: item[0], reverse=True):
+        replacement = f"{marker}{sentence}{marker}"
+        blocks[index] = blocks[index].replace(sentence, replacement, 1)
+    return "\n\n".join(blocks)
 
 
 def grounded_personal_passage(topic: dict) -> str:
@@ -663,7 +719,7 @@ def normalize_body_placeholders(body: str, topic: dict) -> str:
 def readability_markup(markdown: str, title: str = "") -> dict:
     prompt = f"""你是公众号排版编辑。只给下面这篇 Markdown 正文增加少量可读性标记，不得改写、删减、补造或调换任何文字。
 允许的标记只有：**重点加粗**、==重点高亮==、__重点下划线__、^^朱砂强调色^^。
-每 300 到 500 字最多标记 1 到 2 处，优先标记结论、转折、关键判断或读者需要记住的短句，不要整段加粗，不要给标题加标记。
+    全文只标记 4 到 10 处，优先标记结论、转折、关键判断、方法和风险提醒，不要整段加粗，不要给标题加标记。
 输出 JSON，只有一个字段 body。
 
 文章标题：{title}
@@ -678,15 +734,17 @@ def readability_markup(markdown: str, title: str = "") -> dict:
                 result = json.loads(match.group(0))
                 body = str(result.get("body", "")).strip()
                 mark_count = len(re.findall(r"\*\*[^*]+\*\*|==[^=]+==|__[^_]+__|\^\^[^\^]+\^\^", body))
-                mark_budget = max(4, min(14, len(markdown_text_only(markdown)) // 450 + 1))
-                if body and len(markdown_text_only(body)) == len(markdown_text_only(markdown)) and mark_count <= mark_budget:
+                plain_length = len(markdown_text_only(markdown))
+                mark_budget = max(4, min(10, plain_length // 400 + 1))
+                minimum_marks = max(4, min(6, plain_length // 700 + 2))
+                if body and len(markdown_text_only(body)) == plain_length and minimum_marks <= mark_count <= mark_budget:
                     return {"body": body, "mode": "model", "message": "已整理重点层级，原文内容未改动"}
             except json.JSONDecodeError:
                 pass
     return {"body": local_readability_markup(markdown), "mode": "local_fallback", "message": error or "已用本地规则整理少量重点"}
 
 
-def generate_draft(draft_id: int) -> dict:
+def generate_draft(draft_id: int, length_preset: str | None = None) -> dict:
     with db_conn() as conn:
         draft_row = conn.execute("SELECT * FROM draft WHERE id=?", (draft_id,)).fetchone()
         if not draft_row:
@@ -695,12 +753,14 @@ def generate_draft(draft_id: int) -> dict:
         source_row = conn.execute("SELECT * FROM source_item WHERE id=?", (topic_row["source_id"],)).fetchone() if topic_row and topic_row["source_id"] else None
     topic = row_to_json(topic_row) or {}
     source = row_to_json(source_row)
+    length_preset = normalize_length_preset(length_preset or draft_row["length_preset"] or "standard")
+    length = length_config(length_preset)
     style_samples = "\n\n".join(f"样本 {sample.get('name', '')}\n{sample.get('excerpt', '')[:900]}" for sample in STYLE_CONTEXT.get("samples", [])[:5])
     prompt = f"""你是数字生命卡兹克的公众号写作协作者。请基于以下资料生成一篇可以直接进入审稿的中文长文。
-严格遵守 Khazix 写作规则，文章要像一个有见识的普通人在认真聊一件打动他的事，不像报告或营销稿。正文目标为 4000 到 6000 个中文字符，至少 18 个自然段。开头从具体事件或当下场景切入，不使用教科书式开场。
+严格遵守 Khazix 写作规则，文章要像一个有见识的普通人在认真聊一件打动他的事，不像报告或营销稿。正文目标为 {length['minimum']} 到 {length['maximum']} 个中文字符，至少 10 个自然段。开头从具体事件或当下场景切入，不使用教科书式开场。
 不要编造作者没有提供或历史样本中没有出现的具体经历、数字、引语、人物、时间和测试结果。缺失第一手经历时，不要留下待补、这里应该放、等作者补充等占位符；改用已有作者观察、历史文章中已经发生的工具使用和当前工作流形成谨慎的个人判断，不把推测写成亲历事实。文章必须完整结束。
 除非文章本身是方法论分条，不使用 Markdown 二级标题，不用项目符号堆成提纲。靠口语化转场、短段落、疑问句和少量断裂句推进。不要使用首先、其次、最后、综上所述、值得注意的是、说白了、意味着什么、本质上、换句话说、不可否认等套话，不使用冒号、破折号和双引号。
-知识要自然地聊出来，每个核心观点都要有具体事实、场景、工具名称、数据或来源支撑，并加入对读者处境的理解、一个自然的文化或历史参照，以及结尾回扣。可以少量使用 **重点加粗**、==重点高亮==、__重点下划线__ 或 ^^朱砂强调色^^，但每 500 字最多 2 处，不要整段标记。
+知识要自然地聊出来，每个核心观点都要有具体事实、场景、工具名称、数据或来源支撑，并加入对读者处境的理解、一个自然的文化或历史参照，以及结尾回扣。正文先输出普通 Markdown，不要添加加粗、高亮或下划线，重点标记由编辑部后处理。
 输出 JSON，字段为 title_candidates（3个标题）、title、digest、outline（数组）、body、evidence（数组）、claims（数组）。claims 中明确区分 kind= fact / judgement / inference，并为 fact 填写 source。
 
 选题：{json.dumps(topic, ensure_ascii=False)}
@@ -722,21 +782,26 @@ def generate_draft(draft_id: int) -> dict:
             except json.JSONDecodeError:
                 result = None
     if not result:
-        result = local_draft(topic, source)
+        result = local_draft(topic, source, length_preset)
         result["model_note"] = error or "已使用本地协作模板"
-    result["body"] = normalize_body_placeholders(str(result.get("body", "")), topic)
+    result["body"] = normalize_markdown_blocks(normalize_body_placeholders(str(result.get("body", "")), topic))
+    result["body"] = trim_body_to_budget(result["body"], length_preset)
+    layout = readability_markup(result["body"], str(result.get("title", "")))
+    result["body"] = layout["body"]
+    result["readability_mode"] = layout.get("mode", "local_fallback")
     candidates = result.get("title_candidates")
     if isinstance(candidates, str):
         candidates = [candidates]
     result["title_candidates"] = candidates if isinstance(candidates, list) and candidates else [result.get("title", "")]
     if not isinstance(result.get("claims"), list) or not result.get("claims"):
-        result["claims"] = local_draft(topic, source).get("claims", [])
-    result["quality_report"] = quality_check(result.get("body", ""), result.get("evidence", []) if isinstance(result.get("evidence"), list) else [])
+        result["claims"] = local_draft(topic, source, length_preset).get("claims", [])
+    result["length_preset"] = length_preset
+    result["quality_report"] = quality_check(result.get("body", ""), result.get("evidence", []) if isinstance(result.get("evidence"), list) else [], length_preset)
     with db_conn() as conn:
-        conn.execute("UPDATE draft SET title=?,digest=?,body=?,outline=?,evidence=?,title_candidates=?,claims=?,quality_report=?,style_profile_id=?,status=?,updated_at=? WHERE id=?",
+        conn.execute("UPDATE draft SET title=?,digest=?,body=?,outline=?,evidence=?,title_candidates=?,claims=?,length_preset=?,quality_report=?,style_profile_id=?,status=?,updated_at=? WHERE id=?",
                      (result.get("title", ""), result.get("digest", ""), result.get("body", ""), json.dumps(result.get("outline", []), ensure_ascii=False),
                       json.dumps(result.get("evidence", []), ensure_ascii=False), json.dumps(result.get("title_candidates", []), ensure_ascii=False),
-                      json.dumps(result.get("claims", []), ensure_ascii=False), json.dumps(result["quality_report"], ensure_ascii=False), current_style_profile_id(), "待审稿", now_iso(), draft_id))
+                      json.dumps(result.get("claims", []), ensure_ascii=False), length_preset, json.dumps(result["quality_report"], ensure_ascii=False), current_style_profile_id(), "待审稿", now_iso(), draft_id))
         row = conn.execute("SELECT * FROM draft WHERE id=?", (draft_id,)).fetchone()
     result["draft"] = row_to_json(row)
     return result
@@ -745,8 +810,10 @@ def generate_draft(draft_id: int) -> dict:
 FORBIDDEN_WORDS = ["说白了", "意味着什么", "这意味着", "本质上", "换句话说", "不可否认", "综上所述", "总的来说", "值得注意的是", "不难发现", "让我们来看看", "接下来让我们"]
 
 
-def quality_check(body: str, evidence: list | None = None) -> dict:
+def quality_check(body: str, evidence: list | None = None, length_preset: str = "standard") -> dict:
     evidence = evidence or []
+    length_preset = normalize_length_preset(length_preset)
+    length = length_config(length_preset)
     plain = markdown_text_only(body or "")
     hits = {word: body.count(word) for word in FORBIDDEN_WORDS if word in body}
     punctuation = {mark: body.count(mark) for mark in ["：", "——", '"', "“", "”"] if mark in body}
@@ -761,7 +828,13 @@ def quality_check(body: str, evidence: list | None = None) -> dict:
     heading_count = len(re.findall(r"^#{1,6}\s+", body, re.M))
     list_count = len(re.findall(r"^(?:[-*]\s+|\d+[.)]\s+)", body, re.M))
     emphasis_count = len(re.findall(r"\*\*[^*]+\*\*|==[^=]+==|__[^_]+__|\^\^[^\^]+\^\^", body))
-    length_ok = 3800 <= len(plain) <= 8500
+    emphasis_budget = max(4, min(10, len(plain) // 400 + 1))
+    emphasis_minimum = max(3, min(6, len(plain) // 700 + 2)) if plain else 0
+    paragraph_keys = [re.sub(r"\W+", "", markdown_text_only(paragraph))[:90] for paragraph in paragraphs]
+    repeated_paragraphs = len(paragraph_keys) - len(set(paragraph_keys))
+    empty_expression_hits = sum(body.count(term) for term in ["很重要", "非常关键", "值得关注", "有很多可能", "带来新的机遇"])
+    length_ok = length["minimum"] <= len(plain) <= length["maximum"]
+    density_ok = len(paragraphs) >= 10 and repeated_paragraphs <= max(1, len(paragraphs) // 8) and empty_expression_hits <= 3
     checks = {
         "硬性规则": not hits and not punctuation and not placeholders,
         "长文长度": length_ok,
@@ -770,14 +843,15 @@ def quality_check(body: str, evidence: list | None = None) -> dict:
         "口语与个人判断": len(spoken) >= 2 and has_personal,
         "内容支撑": len(paragraphs) >= 10 and (has_specific_detail or bool(evidence)),
         "证据链": bool(evidence),
+        "信息密度": density_ok,
         "结构克制": heading_count <= 1 and list_count <= 3,
-        "重点克制": emphasis_count <= max(8, len(plain) // 220),
+        "重点存在": emphasis_minimum <= emphasis_count <= emphasis_budget,
     }
     passed = sum(bool(value) for value in checks.values())
-    passed_ok = all(checks[key] for key in ("硬性规则", "长文长度", "内容支撑", "证据链", "结构克制")) and passed >= 7
+    passed_ok = all(checks[key] for key in ("硬性规则", "长文长度", "内容支撑", "证据链", "信息密度", "结构克制", "重点存在")) and passed >= 9
     next_actions = []
     if not length_ok:
-        next_actions.append(f"正文当前 {len(plain)} 字，长文建议控制在 3800 到 8500 字并保证信息密度")
+        next_actions.append(f"正文当前 {len(plain)} 字，当前档位建议控制在 {length['minimum']} 到 {length['maximum']} 字")
     if placeholders:
         next_actions.append("移除待补、这里应该放等占位表达，改用已有观察或谨慎判断完整收束")
     if hits or punctuation:
@@ -788,14 +862,18 @@ def quality_check(body: str, evidence: list | None = None) -> dict:
         next_actions.append("至少绑定一条可回溯来源，并区分事实、判断和推断")
     if not checks["结构克制"]:
         next_actions.append("减少 Markdown 小标题和项目符号，改用口语化转场推进")
-    if not checks["重点克制"]:
-        next_actions.append("减少加粗、高亮或下划线，只保留金句、方法和技巧")
+    if not checks["信息密度"]:
+        next_actions.append("删除重复观点和空泛表达，让每个段落都推进事实、判断或行动")
+    if not checks["重点存在"]:
+        next_actions.append(f"补充 {emphasis_minimum} 到 {emphasis_budget} 处重点，只标记金句、方法、技巧和风险")
     return {"passed": passed_ok, "score": f"{passed}/{len(checks)}", "forbidden_words": hits, "punctuation": punctuation,
             "spoken_markers": spoken, "placeholders": placeholders, "specific_detail": has_specific_detail,
-            "plain_length": len(plain), "heading_count": heading_count, "list_count": list_count, "emphasis_count": emphasis_count,
+            "plain_length": len(plain), "length_preset": length_preset, "target_length": length,
+            "heading_count": heading_count, "list_count": list_count, "emphasis_count": emphasis_count,
+            "repeated_paragraphs": repeated_paragraphs, "empty_expression_hits": empty_expression_hits,
             "evidence_count": len(evidence), "checks": checks, "layers": {
                 "硬性禁用词": checks["硬性规则"], "风格一致性": checks["开头具体"] and checks["节奏层次"] and checks["口语与个人判断"],
-                "内容支撑": checks["内容支撑"] and checks["证据链"], "活人感终审": checks["口语与个人判断"] and not placeholders},
+                "内容支撑": checks["内容支撑"] and checks["证据链"] and checks["信息密度"], "活人感终审": checks["口语与个人判断"] and not placeholders},
             "next_actions": next_actions}
 
 
@@ -999,6 +1077,28 @@ def choose_image_blocks(body: str) -> tuple[list[str], list[int], int]:
     return blocks, sorted(positions[:needed]), target_count
 
 
+ABSTRACT_VISUAL_TERMS = (
+    "判断", "趋势", "价值", "意义", "未来", "普通人", "成本", "选择", "方法", "风险",
+    "机会", "门槛", "能力", "影响", "变化", "习惯", "效率", "注意力", "观点", "结论",
+)
+CONCRETE_VISUAL_TERMS = (
+    "屏幕", "页面", "按钮", "图片", "文件", "工作台", "手", "房间", "人物", "桌面", "手机",
+    "电脑", "键盘", "纸张", "镜头", "窗口", "产品", "办公室", "街道", "商店", "实验室", "操作",
+    "金额", "数字", "时间", "聊天", "代码", "文章", "原文", "界面", "会议", "模型",
+)
+
+
+def paragraph_visual_kind(text: str) -> str:
+    """Choose a visual treatment before asking an image model to draw anything."""
+    plain = markdown_text_only(text)
+    abstract_score = sum(1 for term in ABSTRACT_VISUAL_TERMS if term in plain)
+    concrete_score = sum(1 for term in CONCRETE_VISUAL_TERMS if term in plain)
+    has_number = bool(re.search(r"\d+(?:\.\d+)?\s*(?:%|元|万|亿|岁|天|次|张|字)?", plain))
+    if concrete_score >= 2 or (concrete_score and has_number and abstract_score <= concrete_score + 1):
+        return "ai_scene"
+    return "info_card"
+
+
 def source_urls_for_draft(topic: dict, evidence: list) -> list[str]:
     urls: list[str] = []
     source_url = str(topic.get("source_url") or "").strip()
@@ -1074,6 +1174,7 @@ def auto_layout_draft_images(draft_id: int, body_override: str = "", title_overr
     placements: dict[int, dict] = {}
     source_used = 0
     generated: list[dict] = []
+    info_cards: list[dict] = []
     failures = list(import_failures)
     for slot_index, block_index in enumerate(positions):
         if source_used < len(unique_assets):
@@ -1084,11 +1185,19 @@ def auto_layout_draft_images(draft_id: int, body_override: str = "", title_overr
         selected = markdown_text_only(blocks[block_index])[:1000]
         context = "\n".join(markdown_text_only(blocks[i])[:260] for i in range(max(0, block_index - 1), min(len(blocks), block_index + 2)))
         try:
-            prompt_result = image_prompt_from_selection(selected, title, context)
-            generated_asset = generate_image_asset(prompt_result["prompt"], "正文插图")
-            generated_asset["image_prompt"] = prompt_result["prompt"]
-            placements[block_index] = generated_asset
-            generated.append(generated_asset)
+            visual_kind = paragraph_visual_kind(selected)
+            if visual_kind == "info_card":
+                card = generate_local_info_card(selected, "正文信息卡")
+                card["visual_kind"] = visual_kind
+                placements[block_index] = card
+                info_cards.append(card)
+            else:
+                prompt_result = image_prompt_from_selection(selected, title, context)
+                generated_asset = generate_image_asset(prompt_result["prompt"], "正文插图")
+                generated_asset["image_prompt"] = prompt_result["prompt"]
+                generated_asset["visual_kind"] = visual_kind
+                placements[block_index] = generated_asset
+                generated.append(generated_asset)
         except Exception as exc:
             failures.append(f"第 {slot_index + 1} 张配图：{redact_sensitive(exc)}")
 
@@ -1099,14 +1208,14 @@ def auto_layout_draft_images(draft_id: int, body_override: str = "", title_overr
         updated = conn.execute("SELECT * FROM draft WHERE id=?", (draft_id,)).fetchone()
     completed_count = existing_count + len(inserted)
     remaining_count = max(0, target_count - completed_count)
-    message = f"配图规划 {target_count} 张：本次来源图 {source_used} 张，AI 补图 {len(generated)} 张，正文现有 {existing_count} 张"
+    message = f"配图规划 {target_count} 张：来源图 {source_used} 张，信息卡 {len(info_cards)} 张，AI 场景图 {len(generated)} 张，正文现有 {existing_count} 张"
     if remaining_count:
         message += f"，仍缺 {remaining_count} 张"
     if failures:
         detail = "；".join(str(item) for item in failures[:2])
         message += f"。失败 {len(failures)} 项：{detail}"
     return {"ok": True, "draft": row_to_json(updated), "target_count": target_count, "planned": positions,
-            "inserted": inserted, "source_imported": unique_assets, "generated": generated, "failed": failures,
+            "inserted": inserted, "source_imported": unique_assets, "generated": generated, "info_cards": info_cards, "failed": failures,
             "remaining": remaining_count, "message": message}
 
 
@@ -1134,6 +1243,7 @@ def image_prompt_from_selection(selected_text: str, title: str = "", context: st
         raise ValueError("请先在正文中选中一段文字")
     selected_text = selected_text[:2400]
     context = context.strip()[:1200]
+    visual_mode = paragraph_visual_kind(selected_text)
     prompt = f"""你是公众号编辑部的视觉编辑。请把下面选中的文章段落转换成一条可直接用于图片生成模型的中文提示词。
 不要复述文章，不要生成图片中的文字，不要编造真实人物、品牌标志或新闻现场。画面必须服务于段落中明确出现的事实、对象、动作或环境；如果段落只有抽象判断，就用一个克制、可理解的日常物件或真实空间承载它，不要制造无意义的“科技感”。
 禁止机器人、发光网络、漂浮图标、随机仪表盘、通用蓝紫渐变、无关人物、无关城市天际线和装饰性 3D 图标。
@@ -1152,14 +1262,14 @@ def image_prompt_from_selection(selected_text: str, title: str = "", context: st
                 generated = str(result.get("prompt", "")).strip()
                 if generated:
                     return {"prompt": generated, "visual_intent": str(result.get("visual_intent", "")),
-                            "avoid": str(result.get("avoid", "")), "mode": "model"}
+                            "avoid": str(result.get("avoid", "")), "mode": "model", "visual_mode": visual_mode}
             except json.JSONDecodeError:
                 pass
     fallback = (f"为公众号正文制作一张克制的纪实编辑配图，准确围绕段落中的具体内容“{selected_text[:180]}”取一个可视化瞬间；"
                 "优先使用真实日常物件、工作台、纸张、屏幕、手部动作或室内环境，不添加段落没有提到的人物和符号；"
                 "自然光，低饱和米白、墨黑、少量朱砂红，平面摄影或杂志纪实摄影，构图清楚，留白适中，横向 4:3。"
                 "画面内不要出现文字、水印、Logo、机器人、发光网络、漂浮图标、蓝紫渐变和通用科技背景。")
-    return {"prompt": fallback, "visual_intent": "把段落中的具体对象或动作转成纪实配图", "avoid": "文字、水印、Logo、机器人、发光网络、漂浮图标、通用科技背景", "mode": "local_fallback", "model_note": error or "未配置文本模型，使用本地提示词转换"}
+    return {"prompt": fallback, "visual_intent": "把段落中的具体对象或动作转成纪实配图", "avoid": "文字、水印、Logo、机器人、发光网络、漂浮图标、通用科技背景", "mode": "local_fallback", "visual_mode": visual_mode, "model_note": error or "未配置文本模型，使用本地提示词转换"}
 
 
 def save_generated_image(raw: bytes, prompt: str, usage: str, rights_note: str) -> dict:
@@ -1383,6 +1493,59 @@ def generate_local_editorial_asset(prompt: str, usage: str) -> dict:
                              (filename, str(output.relative_to(ROOT)), "image", "", "", "local", "本地原创视觉，未调用外部模型", prompt, usage, now_iso()))
     return {"id": cursor.lastrowid, "name": filename, "path": str(output.relative_to(ROOT)), "prompt": prompt, "usage": usage,
             "mode": "local_editorial", "message": "本地原创配图已保存（未调用外部模型）"}
+
+
+def generate_local_info_card(text: str, usage: str = "正文信息卡") -> dict:
+    """Make a restrained editorial card for abstract paragraphs without calling an image model."""
+    plain = markdown_text_only(text)
+    if not plain:
+        raise ValueError("信息卡内容为空")
+    filename = f"info-card-{int(time.time())}-{uuid.uuid4().hex[:8]}.png"
+    output = ASSET_DIR / filename
+    label = "一句判断"
+    if re.search(r"(?:可以|建议|先.*再|方法|步骤|做法)", plain):
+        label = "可执行方法"
+    elif re.search(r"(?:风险|不要|别急|不能|成本)", plain):
+        label = "风险提醒"
+    if Image is None:
+        write_editorial_png(output)
+    else:
+        width, height = 1200, 760
+        image = Image.new("RGB", (width, height), "#f5f1e8")
+        draw = ImageDraw.Draw(image)
+        font_paths = [
+            "/System/Library/Fonts/PingFang.ttc",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ]
+
+        def font(size: int):
+            for candidate in font_paths:
+                if Path(candidate).exists():
+                    try:
+                        return ImageFont.truetype(candidate, size)
+                    except OSError:
+                        pass
+            return ImageFont.load_default()
+
+        small, label_font, body_font, foot = font(22), font(28), font(48), font(20)
+        draw.rectangle((64, 64, width - 64, height - 64), outline="#1d1c19", width=3)
+        draw.rectangle((64, 64, 84, height - 64), fill="#b44735")
+        draw.text((112, 104), "EDITORIAL DESK / INFO CARD", fill="#6b655b", font=small)
+        draw.text((112, 172), label, fill="#b44735", font=label_font)
+        draw.line((112, 230, 1088, 230), fill="#d8d0c3", width=2)
+        card_text = plain[:92] + ("…" if len(plain) > 92 else "")
+        wrapped = "\n".join(card_text[index:index + 18] for index in range(0, len(card_text), 18))
+        draw.multiline_text((112, 286), wrapped, fill="#1d1c19", font=body_font, spacing=12)
+        draw.rectangle((1000, 590, 1060, 650), fill="#d4ef38")
+        draw.text((112, 660), "正文配图 · 信息卡补位 · 不调用外部模型", fill="#6b655b", font=foot)
+        image.save(output, format="PNG")
+    card_prompt = f"{label}：{plain[:240]}"
+    with db_conn() as conn:
+        cursor = conn.execute("INSERT INTO asset(name,path,kind,source_url,source_page_url,source_kind,rights_note,prompt,usage,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                             (filename, str(output.relative_to(ROOT)), "image", "", "", "local", "本地编辑信息卡，非外部图片，适合抽象段落", card_prompt, usage, now_iso()))
+    return {"id": cursor.lastrowid, "name": filename, "path": str(output.relative_to(ROOT)), "prompt": card_prompt,
+            "usage": usage, "mode": "local_info_card", "message": "已用本地信息卡补足抽象段落"}
 
 
 def md_to_html(markdown: str, image_map: dict[str, str] | None = None) -> str:
@@ -1767,20 +1930,20 @@ class Handler(BaseHTTPRequestHandler):
                                          (source_id, title, core_angle, body.get("audience", ""), body.get("personal_observation", ""), body.get("lived_experience", ""), body.get("emotional_note", ""),
                                           int(body.get("h_score", 0) or 0), int(body.get("k_score", 0) or 0), int(body.get("r_score", 0) or 0), body.get("window", "7d"), body.get("status", "待判断"), timestamp, timestamp))
                     topic_id = cursor.lastrowid
-                    draft_cursor = conn.execute("INSERT INTO draft(topic_id,status,created_at,updated_at) VALUES(?,?,?,?)", (topic_id, "写作中", timestamp, timestamp))
+                    draft_cursor = conn.execute("INSERT INTO draft(topic_id,length_preset,status,created_at,updated_at) VALUES(?,?,?,?,?)", (topic_id, "standard", "写作中", timestamp, timestamp))
                 return self.send_json({"ok": True, "topic_id": topic_id, "draft_id": draft_cursor.lastrowid})
             if path == "/api/drafts/blank":
                 timestamp = now_iso()
                 with db_conn() as conn:
-                    cursor = conn.execute("INSERT INTO draft(topic_id,title,digest,body,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
-                                         (None, "", "", "", "写作中", timestamp, timestamp))
+                    cursor = conn.execute("INSERT INTO draft(topic_id,title,digest,body,length_preset,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                                         (None, "", "", "", "standard", "写作中", timestamp, timestamp))
                     row = conn.execute("SELECT * FROM draft WHERE id=?", (cursor.lastrowid,)).fetchone()
                 return self.send_json({"ok": True, "draft_id": cursor.lastrowid, "draft": row_to_json(row)})
             topic_match = re.match(r"^/api/topics/(\d+)/draft$", path)
             if topic_match:
                 topic_id = int(topic_match.group(1))
                 with db_conn() as conn:
-                    cursor = conn.execute("INSERT INTO draft(topic_id,status,created_at,updated_at) VALUES(?,?,?,?)", (topic_id, "写作中", now_iso(), now_iso()))
+                    cursor = conn.execute("INSERT INTO draft(topic_id,length_preset,status,created_at,updated_at) VALUES(?,?,?,?,?)", (topic_id, "standard", "写作中", now_iso(), now_iso()))
                 return self.send_json({"ok": True, "draft_id": cursor.lastrowid})
             auto_images_match = re.match(r"^/api/drafts/(\d+)/auto-images$", path)
             if auto_images_match:
@@ -1801,7 +1964,7 @@ class Handler(BaseHTTPRequestHandler):
             if draft_match:
                 draft_id, action = int(draft_match.group(1)), draft_match.group(2)
                 if action == "generate":
-                    return self.send_json(generate_draft(draft_id))
+                    return self.send_json(generate_draft(draft_id, body.get("length_preset")))
                 if action == "readability":
                     with db_conn() as conn:
                         draft_for_layout = conn.execute("SELECT title,body FROM draft WHERE id=?", (draft_id,)).fetchone()
@@ -1815,14 +1978,16 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(layout)
                 if action == "quality":
                     with db_conn() as conn:
-                        draft_for_quality = conn.execute("SELECT evidence FROM draft WHERE id=?", (draft_id,)).fetchone()
+                        draft_for_quality = conn.execute("SELECT evidence,length_preset FROM draft WHERE id=?", (draft_id,)).fetchone()
                     evidence = safe_json_load(draft_for_quality["evidence"] if draft_for_quality else "[]", [])
-                    result = quality_check(body.get("body", ""), evidence if isinstance(evidence, list) else [])
+                    preset = normalize_length_preset(body.get("length_preset") or (draft_for_quality["length_preset"] if draft_for_quality else "standard"))
+                    result = quality_check(body.get("body", ""), evidence if isinstance(evidence, list) else [], preset)
                     with db_conn() as conn:
                         conn.execute("UPDATE draft SET quality_report=?,status=?,updated_at=? WHERE id=?", (json.dumps(result, ensure_ascii=False), "待排版" if result["passed"] else "待审稿", now_iso(), draft_id))
                     return self.send_json(result)
                 with db_conn() as conn:
-                    conn.execute("UPDATE draft SET title=?,digest=?,body=?,status=?,cover_asset_id=?,updated_at=? WHERE id=?", (body.get("title", ""), body.get("digest", ""), body.get("body", ""), body.get("status", "写作中"), body.get("cover_asset_id") or None, now_iso(), draft_id))
+                    preset = normalize_length_preset(body.get("length_preset", "standard"))
+                    conn.execute("UPDATE draft SET title=?,digest=?,body=?,length_preset=?,status=?,cover_asset_id=?,updated_at=? WHERE id=?", (body.get("title", ""), body.get("digest", ""), body.get("body", ""), preset, body.get("status", "写作中"), body.get("cover_asset_id") or None, now_iso(), draft_id))
                 return self.send_json({"ok": True})
             if path == "/api/assets/import-url":
                 return self.send_json(import_images_from_url(str(body.get("url", "")).strip()))
@@ -1832,6 +1997,12 @@ class Handler(BaseHTTPRequestHandler):
                 prompt = str(body.get("prompt", "")).strip()
                 if not prompt:
                     raise ValueError("图片提示词为空")
+                if str(body.get("visual_mode", "")).strip() == "info_card":
+                    selected_text = str(body.get("selected_text", "")).strip()
+                    if selected_text:
+                        result = generate_local_info_card(selected_text, str(body.get("usage", "正文信息卡")))
+                        result["image_prompt"] = prompt
+                        return self.send_json(result)
                 result = generate_image_asset(prompt, str(body.get("usage", "正文插图")))
                 result["image_prompt"] = prompt
                 return self.send_json(result)
