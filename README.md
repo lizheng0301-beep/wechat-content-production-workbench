@@ -67,6 +67,14 @@ export OPENAI_MODEL="deepseek-chat"
 
 如果中转服务提供 OpenAI 兼容接口，也可以把 `OPENAI_BASE_URL` 改成中转服务地址。
 
+也可以直接使用 DeepSeek 变量名，效果相同：
+
+```bash
+export DEEPSEEK_API_KEY="你的 DeepSeek Key"
+export DEEPSEEK_BASE_URL="https://api.deepseek.com"
+export DEEPSEEK_MODEL="deepseek-chat"
+```
+
 ### OpenAI 兼容图片模型
 
 ```bash

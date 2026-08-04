@@ -70,7 +70,7 @@ def json_bytes(value: object) -> bytes:
 
 def redact_sensitive(value: object) -> str:
     message = str(value)
-    for env_name in ("OPENAI_API_KEY", "RIGHTCODE_API_KEY", "RIGHT_CODE_API_KEY", "WECHAT_APP_SECRET", "WECHAT_APP_ID"):
+    for env_name in ("OPENAI_API_KEY", "DEEPSEEK_API_KEY", "RIGHTCODE_API_KEY", "RIGHT_CODE_API_KEY", "WECHAT_APP_SECRET", "WECHAT_APP_ID"):
         secret = os.getenv(env_name, "")
         if secret:
             message = message.replace(secret, "[redacted]")
@@ -508,11 +508,15 @@ def get_drafts(limit: int = 50) -> list[dict]:
 
 
 def read_text_model(prompt: str, system: str = "") -> tuple[bool, str, str]:
-    api_key = os.getenv("OPENAI_API_KEY", "")
+    api_key = os.getenv("OPENAI_API_KEY", "") or os.getenv("DEEPSEEK_API_KEY", "")
     if not api_key:
-        return False, "", "未配置 OPENAI_API_KEY，已使用本地协作模板"
-    base = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+        return False, "", "未配置 OPENAI_API_KEY 或 DEEPSEEK_API_KEY，已使用本地协作模板"
+    if os.getenv("OPENAI_API_KEY"):
+        base = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+        model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+    else:
+        base = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
+        model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
     payload = {"model": model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}], "temperature": 0.7}
     if "deepseek.com" in base:
         payload["response_format"] = {"type": "json_object"}
@@ -1584,20 +1588,20 @@ def dashboard() -> dict:
         writing_count = conn.execute("SELECT COUNT(*) AS count FROM draft WHERE status NOT IN ('草稿已创建','已归档')").fetchone()["count"]
         asset_count = conn.execute("SELECT COUNT(*) AS count FROM asset").fetchone()["count"]
         metric_count = conn.execute("SELECT COUNT(*) AS count FROM metric_record").fetchone()["count"]
-    model_configured = bool(os.getenv("OPENAI_API_KEY") or os.getenv("RIGHTCODE_API_KEY") or os.getenv("RIGHT_CODE_API_KEY"))
+    model_configured = bool(os.getenv("OPENAI_API_KEY") or os.getenv("DEEPSEEK_API_KEY") or os.getenv("RIGHTCODE_API_KEY") or os.getenv("RIGHT_CODE_API_KEY"))
     return {"hot_count": hot_count, "topic_count": topic_count, "writing_count": writing_count, "asset_count": asset_count, "metric_count": metric_count,
             "style": {"name": "数字生命卡兹克", "skill_loaded": bool(STYLE_CONTEXT.get("skill_path")), "sample_count": len(STYLE_CONTEXT.get("samples", []))},
             "integrations": {"aihot": True, "model": model_configured, "wechat": WECHAT.configured}}
 
 
 def integration_status() -> dict:
-    model_configured = bool(os.getenv("OPENAI_API_KEY") or os.getenv("RIGHTCODE_API_KEY") or os.getenv("RIGHT_CODE_API_KEY"))
+    model_configured = bool(os.getenv("OPENAI_API_KEY") or os.getenv("DEEPSEEK_API_KEY") or os.getenv("RIGHTCODE_API_KEY") or os.getenv("RIGHT_CODE_API_KEY"))
     return {
         "local": {"ok": True, "host": HOST, "message": "仅绑定本机，凭据不写入内容库"},
         "aihot": {"ok": True, "configured": True, "name": "AI HOT", "message": "公开只读热点接口，可同步并缓存"},
         "model": {"ok": model_configured, "configured": model_configured,
                   "name": "写作 / 图片模型", "message": "支持 DeepSeek/OpenAI 写作与 Right Code 图片模型中转配图；未配置时使用本地模板",
-                  "env": ["OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL", "OPENAI_IMAGE_API_KEY", "OPENAI_IMAGE_BASE_URL", "OPENAI_IMAGE_MODEL", "RIGHTCODE_API_KEY", "RIGHTCODE_IMAGE_MODEL", "RIGHTCODE_IMAGE_SIZE"]},
+                  "env": ["OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL", "DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL", "OPENAI_IMAGE_API_KEY", "OPENAI_IMAGE_BASE_URL", "OPENAI_IMAGE_MODEL", "RIGHTCODE_API_KEY", "RIGHTCODE_IMAGE_MODEL", "RIGHTCODE_IMAGE_SIZE"]},
         "wechat": {"ok": WECHAT.configured, "configured": WECHAT.configured, "name": "微信公众号",
                    "message": "只创建草稿，不执行群发" if WECHAT.configured else "本地创作可用；配置后才能写入公众号草稿箱",
                    "env": ["WECHAT_APP_ID", "WECHAT_APP_SECRET", "WECHAT_AUTHOR"],
