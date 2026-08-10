@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local editorial workbench for a single WeChat public account.
+"""Local WeChat content production workbench for a single public account.
 
 Run with ``python app.py`` and open http://127.0.0.1:8765.
 The server deliberately binds to loopback only. Secrets are read from env vars.
@@ -56,7 +56,7 @@ DB_PATH = DATA_DIR / "workbench.sqlite3"
 HOST = "127.0.0.1"
 PORT = int(os.getenv("WORKBENCH_PORT", "8765"))
 AIHOT_BASE = "https://aihot.virxact.com/api/v1"
-USER_AGENT = "EditorialWorkbench/1.0 (+local)"
+USER_AGENT = "WeChatContentWorkbench/1.0 (+local)"
 AUTO_IMAGE_JOBS: dict[str, dict] = {}
 AUTO_IMAGE_JOBS_LOCK = threading.Lock()
 LENGTH_PRESETS = {
@@ -76,7 +76,7 @@ def json_bytes(value: object) -> bytes:
 
 def redact_sensitive(value: object) -> str:
     message = str(value)
-    for env_name in ("OPENAI_API_KEY", "DEEPSEEK_API_KEY", "YUZAPI_API_KEY", "YUZ_API_KEY", "RIGHTCODE_API_KEY", "RIGHT_CODE_API_KEY", "WECHAT_APP_SECRET", "WECHAT_APP_ID"):
+    for env_name in ("OPENAI_API_KEY", "OPENAI_IMAGE_API_KEY", "DEEPSEEK_API_KEY", "YUZAPI_API_KEY", "YUZ_API_KEY", "RIGHTCODE_API_KEY", "RIGHT_CODE_API_KEY", "RIGHTCODE_IMAGE_API_KEY", "RIGHT_CODE_IMAGE_API_KEY", "WECHAT_APP_SECRET", "WECHAT_APP_ID"):
         secret = os.getenv(env_name, "")
         if secret:
             message = message.replace(secret, "[redacted]")
@@ -187,6 +187,43 @@ def init_db() -> None:
               value REAL,
               raw_json TEXT DEFAULT '{}'
             );
+            CREATE TABLE IF NOT EXISTS published_article (
+              id INTEGER PRIMARY KEY,
+              draft_id INTEGER,
+              wechat_media_id TEXT DEFAULT '',
+              wechat_msgid TEXT DEFAULT '',
+              title TEXT NOT NULL,
+              article_url TEXT DEFAULT '',
+              published_at TEXT NOT NULL,
+              match_status TEXT DEFAULT 'manual_confirmed',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY(draft_id) REFERENCES draft(id) ON DELETE SET NULL
+            );
+            CREATE TABLE IF NOT EXISTS metric_daily (
+              id INTEGER PRIMARY KEY,
+              article_key TEXT NOT NULL,
+              metric_date TEXT NOT NULL,
+              metric_type TEXT NOT NULL,
+              value REAL NOT NULL DEFAULT 0,
+              source TEXT NOT NULL DEFAULT 'wechat_api',
+              raw_json TEXT DEFAULT '{}',
+              synced_at TEXT NOT NULL,
+              UNIQUE(article_key, metric_date, metric_type, source)
+            );
+            CREATE TABLE IF NOT EXISTS metric_sync_run (
+              id INTEGER PRIMARY KEY,
+              date_from TEXT NOT NULL,
+              date_to TEXT NOT NULL,
+              status TEXT NOT NULL,
+              requested_days INTEGER NOT NULL DEFAULT 0,
+              succeeded_days INTEGER NOT NULL DEFAULT 0,
+              article_count INTEGER NOT NULL DEFAULT 0,
+              metric_count INTEGER NOT NULL DEFAULT 0,
+              error_message TEXT DEFAULT '',
+              started_at TEXT NOT NULL,
+              finished_at TEXT DEFAULT ''
+            );
             CREATE TABLE IF NOT EXISTS setting (
               key TEXT PRIMARY KEY,
               value TEXT DEFAULT ''
@@ -219,7 +256,8 @@ def table_rows(table: str, limit: int = 100) -> list[dict]:
         return [dict(row) for row in rows]
 
 
-BACKUP_TABLES = ("source_item", "topic", "draft", "asset", "publish_job", "metric_record", "style_profile")
+BACKUP_TABLES = ("source_item", "topic", "draft", "asset", "publish_job", "metric_record",
+                 "published_article", "metric_daily", "metric_sync_run", "style_profile")
 
 
 def backup_payload() -> dict:
@@ -518,6 +556,216 @@ def get_drafts(limit: int = 50) -> list[dict]:
           LEFT JOIN publish_job p ON p.id=(SELECT MAX(p2.id) FROM publish_job p2 WHERE p2.draft_id=d.id)
           ORDER BY d.updated_at DESC LIMIT ?""", (limit,)).fetchall()
         return [row_to_json(row) for row in rows]
+
+
+WECHAT_METRIC_LABELS = {
+    "int_page_read_user": "阅读人数",
+    "int_page_read_count": "阅读次数",
+    "ori_page_read_user": "原文页阅读人数",
+    "ori_page_read_count": "原文页阅读次数",
+    "share_user": "分享人数",
+    "share_count": "分享次数",
+    "add_to_fav_user": "收藏人数",
+    "add_to_fav_count": "收藏次数",
+    "int_page_from_session_read_user": "会话阅读人数",
+    "int_page_from_session_read_count": "会话阅读次数",
+}
+
+
+def normalize_article_title(value: object) -> str:
+    return re.sub(r"[\W_]+", "", str(value or "").strip().lower(), flags=re.UNICODE)
+
+
+def published_articles() -> list[dict]:
+    with db_conn() as conn:
+        rows = conn.execute("""SELECT p.*, d.title AS draft_title
+          FROM published_article p LEFT JOIN draft d ON d.id=p.draft_id
+          ORDER BY p.published_at DESC, p.id DESC""").fetchall()
+    return [row_to_json(row) for row in rows]
+
+
+def register_published_article(payload: dict) -> dict:
+    draft_id = int(payload.get("draft_id") or 0) or None
+    title = str(payload.get("title") or "").strip()
+    media_id = ""
+    if draft_id:
+        with db_conn() as conn:
+            draft = conn.execute("SELECT title FROM draft WHERE id=?", (draft_id,)).fetchone()
+            latest_publish = conn.execute("SELECT media_id FROM publish_job WHERE draft_id=? AND status='草稿已创建' ORDER BY id DESC LIMIT 1", (draft_id,)).fetchone()
+        if not draft:
+            raise ValueError("选择的本地文章不存在")
+        title = title or str(draft["title"] or "").strip()
+        media_id = str(latest_publish["media_id"] if latest_publish else "")
+    if not title:
+        raise ValueError("请填写已发布文章标题")
+    published_at = str(payload.get("published_at") or "").strip()[:10]
+    try:
+        datetime.fromisoformat(published_at)
+    except ValueError as exc:
+        raise ValueError("发布日期应为 YYYY-MM-DD") from exc
+    if published_at > datetime.now().date().isoformat():
+        raise ValueError("发布日期不能晚于今天")
+    article_url = str(payload.get("article_url") or "").strip()
+    if article_url:
+        parsed = urlparse(article_url)
+        if parsed.scheme != "https" or not parsed.hostname or not parsed.hostname.endswith("weixin.qq.com"):
+            raise ValueError("文章链接应为 https://mp.weixin.qq.com/ 开头的公众号文章地址")
+    timestamp = now_iso()
+    with db_conn() as conn:
+        existing = None
+        if article_url:
+            existing = conn.execute("SELECT id FROM published_article WHERE article_url=? LIMIT 1", (article_url,)).fetchone()
+        if not existing and draft_id:
+            existing = conn.execute("SELECT id FROM published_article WHERE draft_id=? AND published_at=? LIMIT 1", (draft_id, published_at)).fetchone()
+        if existing:
+            article_id = existing["id"]
+            conn.execute("""UPDATE published_article
+              SET draft_id=?,wechat_media_id=?,title=?,article_url=?,published_at=?,match_status='manual_confirmed',updated_at=?
+              WHERE id=?""", (draft_id, media_id, title, article_url, published_at, timestamp, article_id))
+        else:
+            cursor = conn.execute("""INSERT INTO published_article
+              (draft_id,wechat_media_id,title,article_url,published_at,match_status,created_at,updated_at)
+              VALUES(?,?,?,?,?,'manual_confirmed',?,?)""", (draft_id, media_id, title, article_url, published_at, timestamp, timestamp))
+            article_id = cursor.lastrowid
+        row = conn.execute("SELECT * FROM published_article WHERE id=?", (article_id,)).fetchone()
+    return {"ok": True, "article": row_to_json(row), "message": "已登记发布文章；同步后会用标题和发布日期确认微信数据"}
+
+
+def metric_article_key(item: dict, metric_date: str) -> str:
+    msgid = str(item.get("msgid") or item.get("msg_id") or "").strip()
+    if msgid:
+        return "wechat:" + msgid
+    title_key = normalize_article_title(item.get("title"))
+    stable = title_key or hashlib.sha256(json.dumps(item, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    return f"wechat:{metric_date}:{stable}"
+
+
+def match_published_article(conn: sqlite3.Connection, item: dict, metric_date: str) -> int | None:
+    title_key = normalize_article_title(item.get("title"))
+    if not title_key:
+        return None
+    candidates = conn.execute("SELECT * FROM published_article WHERE published_at=?", (metric_date,)).fetchall()
+    match = next((row for row in candidates if normalize_article_title(row["title"]) == title_key), None)
+    if not match:
+        return None
+    msgid = str(item.get("msgid") or item.get("msg_id") or "").strip()
+    conn.execute("UPDATE published_article SET wechat_msgid=?,match_status='api_matched',updated_at=? WHERE id=?",
+                 (msgid, now_iso(), match["id"]))
+    return int(match["id"])
+
+
+def metric_summary(days: int = 7) -> dict:
+    days = max(1, min(int(days or 7), 30))
+    end_date = datetime.now().date()
+    start_date = end_date - timedelta(days=days - 1)
+    with db_conn() as conn:
+        raw_rows = conn.execute("""SELECT * FROM metric_daily
+          WHERE metric_date BETWEEN ? AND ?
+          ORDER BY CASE source WHEN 'wechat_api' THEN 0 ELSE 1 END, synced_at DESC, id DESC""",
+                                (start_date.isoformat(), end_date.isoformat())).fetchall()
+        latest_sync = conn.execute("SELECT * FROM metric_sync_run ORDER BY id DESC LIMIT 1").fetchone()
+        legacy_count = conn.execute("SELECT COUNT(*) AS count FROM metric_record").fetchone()["count"]
+    selected_rows: dict[tuple[str, str, str], sqlite3.Row] = {}
+    for row in raw_rows:
+        key = (str(row["article_key"]), str(row["metric_date"]), str(row["metric_type"]))
+        selected_rows.setdefault(key, row)
+    rows = list(selected_rows.values())
+    totals = {key: 0.0 for key in WECHAT_METRIC_LABELS}
+    daily_map: dict[str, dict] = {}
+    article_map: dict[str, dict] = {}
+    sources: set[str] = set()
+    for row in rows:
+        item = row_to_json(row) or {}
+        sources.add(str(item.get("source") or "unknown"))
+        metric_type = str(item.get("metric_type") or "")
+        value = float(item.get("value") or 0)
+        if metric_type in totals:
+            totals[metric_type] += value
+        metric_date = str(item.get("metric_date") or "")
+        daily = daily_map.setdefault(metric_date, {"date": metric_date})
+        daily[metric_type] = float(daily.get(metric_type, 0)) + value
+        raw = item.get("raw_json") if isinstance(item.get("raw_json"), dict) else {}
+        article_key = str(item.get("article_key") or "")
+        article = article_map.setdefault(article_key, {
+            "article_key": article_key,
+            "title": str(raw.get("title") or "未返回标题"),
+            "metric_date": metric_date,
+            "published_article_id": raw.get("_published_article_id"),
+        })
+        article[metric_type] = float(article.get(metric_type, 0)) + value
+    articles = sorted(article_map.values(), key=lambda item: (-float(item.get("int_page_read_count", 0)), item.get("title", "")))
+    latest = row_to_json(latest_sync) if latest_sync else None
+    has_data = bool(rows)
+    if has_data and sources == {"manual_import"}:
+        message = "已读取从公众号后台手工登记的真实数据"
+    elif has_data:
+        message = "已读取公众号 API 返回的真实数据"
+    else:
+        message = "尚未收到公众号图文统计；新发布文章的数据可能仍在生成"
+    return {
+        "ok": True,
+        "range": {"date_from": start_date.isoformat(), "date_to": end_date.isoformat(), "days": days},
+        "has_data": has_data,
+        "totals": {key: int(value) if value.is_integer() else value for key, value in totals.items()},
+        "daily": list(daily_map.values()),
+        "articles": articles,
+        "published_articles": published_articles(),
+        "latest_sync": latest,
+        "legacy_ignored": int(legacy_count),
+        "metric_labels": WECHAT_METRIC_LABELS,
+        "sources": sorted(sources),
+        "message": message,
+    }
+
+
+def save_manual_metrics(payload: dict) -> dict:
+    article_id = int(payload.get("published_article_id") or 0)
+    if not article_id:
+        raise ValueError("请先选择一篇已登记的发布文章")
+    with db_conn() as conn:
+        article = conn.execute("SELECT * FROM published_article WHERE id=?", (article_id,)).fetchone()
+    if not article:
+        raise ValueError("已发布文章记录不存在")
+    metric_date = str(payload.get("metric_date") or "").strip()[:10]
+    try:
+        datetime.fromisoformat(metric_date)
+    except ValueError as exc:
+        raise ValueError("数据日期应为 YYYY-MM-DD") from exc
+    if metric_date > datetime.now().date().isoformat():
+        raise ValueError("数据日期不能晚于今天")
+    values: dict[str, float] = {}
+    for metric_type in WECHAT_METRIC_LABELS:
+        raw = payload.get(metric_type)
+        if raw in (None, ""):
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{WECHAT_METRIC_LABELS[metric_type]}必须是数字") from exc
+        if value < 0:
+            raise ValueError(f"{WECHAT_METRIC_LABELS[metric_type]}不能为负数")
+        values[metric_type] = value
+    if not values:
+        raise ValueError("至少填写一个真实指标")
+    article_key = f"published:{article_id}"
+    raw_item = {
+        "_source": "manual_import",
+        "_published_article_id": article_id,
+        "title": article["title"],
+        "ref_date": metric_date,
+        "note": str(payload.get("note") or "公众号后台手工登记")[:300],
+    }
+    raw_json = json.dumps(raw_item, ensure_ascii=False, sort_keys=True)
+    timestamp = now_iso()
+    with db_conn() as conn:
+        for metric_type, value in values.items():
+            conn.execute("""INSERT INTO metric_daily
+              (article_key,metric_date,metric_type,value,source,raw_json,synced_at)
+              VALUES(?,?,?,?,'manual_import',?,?)
+              ON CONFLICT(article_key,metric_date,metric_type,source)
+              DO UPDATE SET value=excluded.value,raw_json=excluded.raw_json,synced_at=excluded.synced_at""",
+                         (article_key, metric_date, metric_type, value, raw_json, timestamp))
+    return {"ok": True, "message": "真实后台数据已登记，并明确标记为手工来源", "summary": metric_summary(7)}
 
 
 def normalize_length_preset(value: object) -> str:
@@ -1165,7 +1413,9 @@ def readability_markup(markdown: str, title: str = "") -> dict:
                     and control_count == expected_callouts and heading_spread
                     and not dense_paragraphs
                     and minimum_marks <= mark_count <= mark_budget):
-                return {"body": body, "mode": "model", "message": "5.6 Sol 已校准章节框、语义框与重点层级，正文内容未改动",
+                layout_model = text_model_state()
+                model_label = " ".join(part for part in (layout_model.get("provider", ""), layout_model.get("model", "")) if part).strip() or "文本模型"
+                return {"body": body, "mode": "model", "message": f"{model_label} 已校准章节框、语义框与重点层级，正文内容未改动",
                         "layout": {"h2": h2_count, "h3": h3_count, "callouts": control_count, "emphasis": mark_count}}
     return {"body": local_readability_markup(markdown), "mode": "local_fallback", "message": error or "模型排版未通过校验，已用本地规则补齐章节框、语义框与重点层级"}
 
@@ -1221,7 +1471,7 @@ def generate_draft(draft_id: int, length_preset: str | None = None) -> dict:
     result["model_name"] = writing_model.get("model", "")
     result["model_fallback"] = bool(writing_model.get("fallback"))
     if result["model_fallback"]:
-        result["model_note"] = f"5.6 Sol 暂时不可用，已使用备用模型 {writing_model.get('provider')} {writing_model.get('model')}"
+        result["model_note"] = f"首选模型暂时不可用，已使用备用模型 {writing_model.get('provider')} {writing_model.get('model')}"
     elif result["model_provider"]:
         result["model_note"] = f"已使用 {result['model_provider']} {result['model_name']} 生成"
     candidates = result.get("title_candidates")
@@ -1745,7 +1995,8 @@ def paragraph_visual_kind(text: str) -> str:
 
 def external_image_model_configured() -> bool:
     """Return whether auto layout can actually call an image endpoint."""
-    if os.getenv("RIGHTCODE_API_KEY", "") or os.getenv("RIGHT_CODE_API_KEY", ""):
+    if (os.getenv("RIGHTCODE_IMAGE_API_KEY", "") or os.getenv("RIGHT_CODE_IMAGE_API_KEY", "") or
+            os.getenv("RIGHTCODE_API_KEY", "") or os.getenv("RIGHT_CODE_API_KEY", "")):
         return True
     if os.getenv("OPENAI_IMAGE_API_KEY", ""):
         return True
@@ -2071,7 +2322,8 @@ def generate_image_asset(prompt: str, usage: str = "原创配图") -> dict:
     prompt = prompt.strip()
     if not prompt:
         raise ValueError("请输入画面描述")
-    rightcode_key = os.getenv("RIGHTCODE_API_KEY", "") or os.getenv("RIGHT_CODE_API_KEY", "")
+    rightcode_key = (os.getenv("RIGHTCODE_IMAGE_API_KEY", "") or os.getenv("RIGHT_CODE_IMAGE_API_KEY", "") or
+                     os.getenv("RIGHTCODE_API_KEY", "") or os.getenv("RIGHT_CODE_API_KEY", ""))
     if rightcode_key:
         return generate_rightcode_image(prompt, usage, rightcode_key)
     api_key = os.getenv("OPENAI_IMAGE_API_KEY", "") or os.getenv("OPENAI_API_KEY", "")
@@ -2308,7 +2560,7 @@ def md_to_html(markdown: str, image_map: dict[str, str] | None = None) -> str:
         elif line == "---":
             close_list()
             paragraph_streak = 0
-            output.append('<hr style="border:0;border-top:1px solid #d8d0c3;margin:30px 0">')
+            output.append('<hr style="width:56px;border:0;border-top:2px solid #b44735;margin:38px auto">')
         elif line.startswith("> "):
             close_list()
             paragraph_streak = 0
@@ -2327,7 +2579,7 @@ def md_to_html(markdown: str, image_map: dict[str, str] | None = None) -> str:
                 output.append(
                     f'<div class="wechat-callout {class_name}" style="margin:28px 0;padding:17px 19px;{frame};background:{background};color:{color};line-height:1.95;border-radius:2px">'
                     f'<div style="margin-bottom:8px"><span style="display:inline-block;padding:2px 7px;border:1px solid {border};'
-                    f'font-size:10px;line-height:1.4;letter-spacing:.12em;color:{border}">{display_label}</span></div>'
+                    f'font-family:-apple-system,BlinkMacSystemFont,\'PingFang SC\',\'Microsoft YaHei\',sans-serif;font-size:10px;line-height:1.4;letter-spacing:.12em;color:{border}">{display_label}</span></div>'
                     f'<div style="font-size:16px;letter-spacing:.02em">{inline_html(content, image_map)}</div></div>'
                 )
             else:
@@ -2335,13 +2587,13 @@ def md_to_html(markdown: str, image_map: dict[str, str] | None = None) -> str:
         elif line.startswith("### "):
             close_list()
             paragraph_streak = 0
-            output.append(f'<h3 class="wechat-h3" style="font-size:17px;line-height:1.6;margin:34px 0 15px;padding-left:12px;border-left:3px solid #758d55;color:#403c35;font-weight:700;letter-spacing:.02em">{inline_html(line[4:], image_map)}</h3>')
+            output.append(f'<h3 class="wechat-h3" style="font-family:-apple-system,BlinkMacSystemFont,\'PingFang SC\',\'Microsoft YaHei\',sans-serif;font-size:17px;line-height:1.6;margin:34px 0 15px;padding-left:12px;border-left:3px solid #758d55;color:#403c35;font-weight:700;letter-spacing:.02em">{inline_html(line[4:], image_map)}</h3>')
         elif line.startswith("## "):
             close_list()
             paragraph_streak = 0
             h2_number += 1
             output.append(
-                f'<h2 class="wechat-h2" style="font-size:20px;line-height:1.55;margin:48px 0 24px;padding:15px 16px 14px;'
+                f'<h2 class="wechat-h2" style="font-family:Georgia,\'Songti SC\',\'STSong\',serif;font-size:20px;line-height:1.55;margin:48px 0 24px;padding:15px 16px 14px;'
                 'border:1px solid #d8d0c3;border-left:5px solid #b44735;background:#fbf8f1;box-shadow:4px 4px 0 #eee7db;'
                 'color:#1d1c19;font-weight:700;letter-spacing:.01em">'
                 f'<span style="display:inline-block;vertical-align:middle;margin-right:10px;padding:2px 7px;border:1px solid #b44735;'
@@ -2351,7 +2603,7 @@ def md_to_html(markdown: str, image_map: dict[str, str] | None = None) -> str:
         elif line.startswith("# "):
             close_list()
             paragraph_streak = 0
-            output.append(f'<h1 style="font-size:28px;line-height:1.35;margin:0 0 1.2em;color:#1d1c19">{inline_html(line[2:], image_map)}</h1>')
+            output.append(f'<h1 style="font-family:Georgia,\'Songti SC\',\'STSong\',serif;font-size:28px;line-height:1.35;margin:0 0 1.2em;color:#1d1c19;font-weight:500;letter-spacing:-.02em">{inline_html(line[2:], image_map)}</h1>')
         elif re.match(r"^[-*] ", line) or re.match(r"^\d+[.)] ", line):
             paragraph_streak = 0
             wanted = "ol" if re.match(r"^\d+[.)] ", line) else "ul"
@@ -2383,6 +2635,16 @@ def inline_html(value: str, image_map: dict[str, str]) -> str:
     return escaped
 
 
+def wrap_wechat_document(content: str) -> str:
+    """Use one self-contained article shell for local preview and WeChat drafts."""
+    return (
+        '<section class="wechat-canvas" style="display:block;width:100%;max-width:620px;margin:0 auto;'
+        'padding:38px 32px 56px;box-sizing:border-box;border:0;background:#fffdf8;color:#37332d;'
+        'font-family:\'Songti SC\',\'STSong\',serif;font-size:16px;line-height:1.95;white-space:normal">'
+        f'{content}</section>'
+    )
+
+
 def wechat_error_message(data: dict, fallback: str = "微信接口请求失败") -> str:
     message = str(data.get("errmsg", "") or fallback) if isinstance(data, dict) else fallback
     lowered = message.lower()
@@ -2392,6 +2654,8 @@ def wechat_error_message(data: dict, fallback: str = "微信接口请求失败")
         return f"公众号 IP 白名单未包含 {ip}。请到公众号后台的 设置与开发 → 基本配置 → IP 白名单，添加 {ip}（只填 IPv4，不要填写 ::ffff: 前缀），保存后再重试。"
     if "unsupported file type" in lowered or "invalid file type" in lowered:
         return "微信拒绝了上传的图片格式。工作台会在重试时把 WebP、AVIF、GIF 等图片转换为 JPEG；请重启工作台后再试。"
+    if data.get("errcode") == 48001:
+        return "当前公众号没有图文数据分析接口权限（48001）。草稿和发布功能不受影响；数据复盘需以公众号后台实际开放权限为准。"
     return message
 
 
@@ -2482,6 +2746,76 @@ class WeChatClient:
 WECHAT = WeChatClient()
 
 
+def sync_wechat_metrics(days: int = 7) -> dict:
+    days = max(1, min(int(days or 7), 7))
+    end_date = datetime.now().date() - timedelta(days=1)
+    start_date = end_date - timedelta(days=days - 1)
+    started_at = now_iso()
+    with db_conn() as conn:
+        cursor = conn.execute("""INSERT INTO metric_sync_run
+          (date_from,date_to,status,requested_days,started_at)
+          VALUES(?,?,'running',?,?)""", (start_date.isoformat(), end_date.isoformat(), days, started_at))
+        run_id = cursor.lastrowid
+    succeeded_days = 0
+    article_count = 0
+    metric_count = 0
+    errors: list[str] = []
+    for offset in range(days):
+        metric_date = start_date + timedelta(days=offset)
+        date_text = metric_date.isoformat()
+        try:
+            result = WECHAT.article_summary(date_text, date_text)
+            items = result.get("list") if isinstance(result.get("list"), list) else []
+            succeeded_days += 1
+            with db_conn() as conn:
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    item_date = str(item.get("ref_date") or date_text)[:10]
+                    article_key = metric_article_key(item, item_date)
+                    published_article_id = match_published_article(conn, item, item_date)
+                    if published_article_id:
+                        article_key = f"published:{published_article_id}"
+                    raw_item = dict(item)
+                    raw_item["_source"] = "wechat_api"
+                    raw_item["_published_article_id"] = published_article_id
+                    raw_item["_missing_fields"] = [key for key in WECHAT_METRIC_LABELS if key not in item]
+                    raw_json = json.dumps(raw_item, ensure_ascii=False, sort_keys=True)
+                    article_count += 1
+                    for metric_type in WECHAT_METRIC_LABELS:
+                        if metric_type not in item:
+                            continue
+                        conn.execute("""INSERT INTO metric_daily
+                          (article_key,metric_date,metric_type,value,source,raw_json,synced_at)
+                          VALUES(?,?,?,?,'wechat_api',?,?)
+                          ON CONFLICT(article_key,metric_date,metric_type,source)
+                          DO UPDATE SET value=excluded.value,raw_json=excluded.raw_json,synced_at=excluded.synced_at""",
+                                     (article_key, item_date, metric_type, float(item.get(metric_type) or 0), raw_json, now_iso()))
+                        metric_count += 1
+        except Exception as exc:
+            error_text = redact_sensitive(exc)
+            errors.append(f"{date_text}：{error_text}")
+            if "48001" in error_text or "没有图文数据分析接口权限" in error_text:
+                break
+    status = "completed" if succeeded_days == days else ("partial" if succeeded_days else "failed")
+    error_message = "；".join(errors)[:4000]
+    with db_conn() as conn:
+        conn.execute("""UPDATE metric_sync_run
+          SET status=?,succeeded_days=?,article_count=?,metric_count=?,error_message=?,finished_at=? WHERE id=?""",
+                     (status, succeeded_days, article_count, metric_count, error_message, now_iso(), run_id))
+        run = conn.execute("SELECT * FROM metric_sync_run WHERE id=?", (run_id,)).fetchone()
+    if status == "failed":
+        return {"ok": False, "error": error_message or "公众号数据同步失败", "sync": row_to_json(run)}
+    summary = metric_summary(days)
+    if article_count:
+        message = f"已按天同步 {succeeded_days}/{days} 天，收到 {article_count} 条图文统计"
+    elif errors:
+        message = f"已同步 {succeeded_days}/{days} 天，但部分日期失败；其余日期暂未返回图文统计"
+    else:
+        message = f"数据接口连接成功，近 {days} 天暂未返回图文统计；新发布文章的数据可能仍在生成"
+    return {"ok": True, "message": message, "sync": row_to_json(run), "summary": summary}
+
+
 def safe_relative_path(value: str) -> Path:
     path = (ROOT / value).resolve()
     if ROOT not in path.parents and path != ROOT:
@@ -2511,7 +2845,7 @@ def prepare_wechat_content(markdown: str, cover_asset_path: Path | None = None) 
         cover_html = (
             '<p class="wechat-cover" style="margin:0 0 30px;text-align:center;line-height:0;">'
             f'<img src="{html.escape(cover_url, quote=True)}" alt="文章封面" '
-            'style="display:block;width:100%;max-width:900px;height:auto;margin:0 auto;" />'
+            'style="display:block;width:100%;max-width:900px;height:auto;margin:0 auto;border-radius:8px;" />'
             '</p>'
         )
     for match in re.finditer(r"!\[[^\]]*\]\(([^)]+)\)", markdown):
@@ -2524,7 +2858,37 @@ def prepare_wechat_content(markdown: str, cover_asset_path: Path | None = None) 
                 image_map[source] = WECHAT.upload_inline(asset_path)
         except Exception as exc:
             raise RuntimeError(f"正文图片上传失败：{source}，{exc}") from exc
-    return cover_html + md_to_html(markdown, image_map)
+    return wrap_wechat_document(cover_html + md_to_html(markdown, image_map))
+
+
+def preview_wechat_content(markdown: str, cover_asset_id: object = None) -> str:
+    """Render the exact production layout locally without uploading any assets."""
+    image_map: dict[str, str] = {}
+    for match in re.finditer(r"!\[[^\]]*\]\(([^)]+)\)", markdown):
+        source = match.group(1).strip()
+        if source in image_map or urlparse(source).scheme in {"http", "https"}:
+            continue
+        try:
+            registered_asset_path(source)
+        except Exception:
+            continue
+        image_map[source] = "/media?path=" + quote(source, safe="")
+
+    cover_html = ""
+    if cover_asset_id:
+        with db_conn() as conn:
+            asset = conn.execute("SELECT path FROM asset WHERE id=?", (int(cover_asset_id),)).fetchone()
+        if asset:
+            asset_path = safe_relative_path(asset["path"])
+            if asset_path.exists() and asset_path.is_file():
+                cover_url = "/media?path=" + quote(asset["path"], safe="")
+                cover_html = (
+                    '<p class="wechat-cover" style="margin:0 0 30px;text-align:center;line-height:0;">'
+                    f'<img src="{html.escape(cover_url, quote=True)}" alt="cover" '
+                    'style="display:block;width:100%;max-width:900px;height:auto;margin:0 auto;border-radius:8px;" />'
+                    '</p>'
+                )
+    return wrap_wechat_document(cover_html + md_to_html(markdown, image_map))
 
 
 def dashboard() -> dict:
@@ -2533,7 +2897,7 @@ def dashboard() -> dict:
         topic_count = conn.execute("SELECT COUNT(*) AS count FROM topic").fetchone()["count"]
         writing_count = conn.execute("SELECT COUNT(*) AS count FROM draft WHERE status NOT IN ('草稿已创建','已归档')").fetchone()["count"]
         asset_count = conn.execute("SELECT COUNT(*) AS count FROM asset").fetchone()["count"]
-        metric_count = conn.execute("SELECT COUNT(*) AS count FROM metric_record").fetchone()["count"]
+        metric_count = conn.execute("SELECT COUNT(*) AS count FROM metric_daily WHERE source='wechat_api'").fetchone()["count"]
     model_configured = bool(os.getenv("YUZAPI_API_KEY") or os.getenv("YUZ_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("DEEPSEEK_API_KEY") or os.getenv("RIGHTCODE_API_KEY") or os.getenv("RIGHT_CODE_API_KEY"))
     return {"hot_count": hot_count, "topic_count": topic_count, "writing_count": writing_count, "asset_count": asset_count, "metric_count": metric_count,
             "style": {"name": "数字生命卡兹克", "skill_loaded": bool(STYLE_CONTEXT.get("skill_path")), "sample_count": len(STYLE_CONTEXT.get("samples", []))},
@@ -2542,7 +2906,9 @@ def dashboard() -> dict:
 
 def integration_status() -> dict:
     provider, model = active_text_model()
-    image_configured = bool(os.getenv("RIGHTCODE_API_KEY") or os.getenv("RIGHT_CODE_API_KEY") or os.getenv("OPENAI_IMAGE_API_KEY"))
+    image_configured = bool(os.getenv("RIGHTCODE_IMAGE_API_KEY") or os.getenv("RIGHT_CODE_IMAGE_API_KEY") or
+                            os.getenv("RIGHTCODE_API_KEY") or os.getenv("RIGHT_CODE_API_KEY") or
+                            os.getenv("OPENAI_IMAGE_API_KEY"))
     model_configured = text_model_configured() or image_configured
     return {
         "local": {"ok": True, "host": HOST, "message": "仅绑定本机，凭据不写入内容库"},
@@ -2551,7 +2917,7 @@ def integration_status() -> dict:
                   "name": "写作 / 图片模型", "provider": provider, "text_model": model,
                   "text_configured": text_model_configured(), "image_configured": image_configured,
                   "message": f"当前写作模型：{provider} {model}；临时故障会明确标记备用模型，不伪装成首选模型",
-                  "env": ["RIGHTCODE_API_KEY", "RIGHTCODE_TEXT_BASE_URL", "RIGHTCODE_TEXT_MODEL", "RIGHTCODE_TEXT_TIMEOUT", "RIGHTCODE_JSON_MODE", "YUZAPI_API_KEY", "YUZAPI_BASE_URL", "YUZAPI_MODEL", "YUZAPI_JSON_MODE", "YUZAPI_OMIT_TEMPERATURE", "YUZAPI_FALLBACK_ENABLED", "TEXT_MODEL_TIMEOUT", "TEXT_MODEL_FALLBACK_TIMEOUT", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL", "DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL", "OPENAI_IMAGE_API_KEY", "OPENAI_IMAGE_BASE_URL", "OPENAI_IMAGE_MODEL", "RIGHTCODE_IMAGE_BASE_URL", "RIGHTCODE_TASK_BASE_URL", "RIGHTCODE_IMAGE_MODEL", "RIGHTCODE_IMAGE_SIZE"]},
+                  "env": ["RIGHTCODE_API_KEY", "RIGHTCODE_TEXT_BASE_URL", "RIGHTCODE_TEXT_MODEL", "RIGHTCODE_TEXT_TIMEOUT", "RIGHTCODE_JSON_MODE", "YUZAPI_API_KEY", "YUZAPI_BASE_URL", "YUZAPI_MODEL", "YUZAPI_JSON_MODE", "YUZAPI_OMIT_TEMPERATURE", "YUZAPI_FALLBACK_ENABLED", "TEXT_MODEL_TIMEOUT", "TEXT_MODEL_FALLBACK_TIMEOUT", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL", "DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL", "OPENAI_IMAGE_API_KEY", "OPENAI_IMAGE_BASE_URL", "OPENAI_IMAGE_MODEL", "RIGHTCODE_IMAGE_API_KEY", "RIGHTCODE_IMAGE_BASE_URL", "RIGHTCODE_TASK_BASE_URL", "RIGHTCODE_IMAGE_MODEL", "RIGHTCODE_IMAGE_SIZE"]},
         "wechat": {"ok": WECHAT.configured, "configured": WECHAT.configured, "name": "微信公众号",
                    "message": "只创建草稿，不执行群发" if WECHAT.configured else "本地创作可用；配置后才能写入公众号草稿箱",
                    "env": ["WECHAT_APP_ID", "WECHAT_APP_SECRET", "WECHAT_AUTHOR"],
@@ -2562,7 +2928,7 @@ def integration_status() -> dict:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "EditorialWorkbench/1.0"
+    server_version = "WeChatContentWorkbench/1.0"
 
     def log_message(self, format: str, *args) -> None:
         sys.stderr.write("[workbench] " + format % args + "\n")
@@ -2631,8 +2997,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(table_rows("asset", 120))
             if path == "/api/metrics":
                 with db_conn() as conn:
-                    rows = conn.execute("SELECT * FROM metric_record ORDER BY observed_at DESC, id DESC LIMIT 200").fetchall()
+                    rows = conn.execute("SELECT * FROM metric_daily WHERE source='wechat_api' ORDER BY metric_date DESC, id DESC LIMIT 500").fetchall()
                 return self.send_json([row_to_json(row) for row in rows])
+            if path == "/api/metrics/summary":
+                days = int((params.get("days") or ["7"])[0])
+                return self.send_json(metric_summary(days))
+            if path == "/api/published-articles":
+                return self.send_json(published_articles())
             if path == "/api/style":
                 with db_conn() as conn:
                     profile = conn.execute("SELECT * FROM style_profile WHERE name=?", ("数字生命卡兹克",)).fetchone()
@@ -2657,9 +3028,9 @@ class Handler(BaseHTTPRequestHandler):
                 data = f"# {title}\n\n{body}\n".encode("utf-8")
                 return self.send_download(data, f"draft-{draft_id}.md", "text/markdown")
             if path == "/api/export":
-                return self.send_download(json_bytes(backup_payload()), f"editorial-backup-{datetime.now().date().isoformat()}.json")
+                return self.send_download(json_bytes(backup_payload()), f"wechat-content-backup-{datetime.now().date().isoformat()}.json")
             if path == "/api/export/package":
-                return self.send_download(backup_package(), f"editorial-workbench-{datetime.now().date().isoformat()}.zip", "application/zip")
+                return self.send_download(backup_package(), f"wechat-content-workbench-{datetime.now().date().isoformat()}.zip", "application/zip")
             if path == "/media":
                 value = (params.get("path") or [""])[0]
                 return self.send_file(registered_asset_path(value))
@@ -2811,8 +3182,15 @@ class Handler(BaseHTTPRequestHandler):
                                          (Path(rel_path).name, rel_path, body.get("kind", "image"), source_url, str(body.get("source_page_url", "")).strip(),
                                           "source" if source_url else "local", body.get("rights_note", "待人工确认"), body.get("prompt", ""), body.get("usage", ""), now_iso()))
                 return self.send_json({"ok": True, "id": cursor.lastrowid})
+            if path == "/api/wechat/preview":
+                return self.send_json({"ok": True, "html": preview_wechat_content(
+                    str(body.get("body", "")), body.get("cover_asset_id"))})
             if path == "/api/wechat/test":
                 return self.send_json(WECHAT.test())
+            if path == "/api/published-articles":
+                return self.send_json(register_published_article(body))
+            if path == "/api/metrics/manual":
+                return self.send_json(save_manual_metrics(body))
             publish_match = re.match(r"^/api/drafts/(\d+)/publish$", path)
             if publish_match:
                 draft_id = int(publish_match.group(1))
@@ -2852,23 +3230,7 @@ class Handler(BaseHTTPRequestHandler):
                         conn.execute("UPDATE publish_job SET status=?,message=?,updated_at=? WHERE id=?", ("失败", redact_sensitive(exc), now_iso(), job_id))
                     raise
             if path == "/api/metrics/sync":
-                end = datetime.now().date()
-                begin = end - timedelta(days=7)
-                result = WECHAT.article_summary(begin.isoformat(), end.isoformat())
-                articles = result.get("list") or []
-                expected_metrics = ("int_page_read_count", "share_count", "add_to_fav_count", "int_page_from_session_read_count")
-                with db_conn() as conn:
-                    for item in articles:
-                        key = str(item.get("ref_date") or item.get("title") or uuid.uuid4().hex)
-                        raw_item = dict(item)
-                        raw_item["_missing_fields"] = [field for field in expected_metrics if field not in item]
-                        raw_json = json.dumps(raw_item, ensure_ascii=False, sort_keys=True)
-                        for metric_type in expected_metrics:
-                            if metric_type in item:
-                                exists = conn.execute("SELECT 1 FROM metric_record WHERE article_key=? AND metric_type=? AND raw_json=? LIMIT 1", (key, metric_type, raw_json)).fetchone()
-                                if not exists:
-                                    conn.execute("INSERT INTO metric_record(article_key,observed_at,metric_type,value,raw_json) VALUES(?,?,?,?,?)", (key, now_iso(), metric_type, float(item.get(metric_type) or 0), raw_json))
-                return self.send_json({"ok": True, "count": len(articles), "message": f"回收 {len(articles)} 条公众号数据"})
+                return self.send_json(sync_wechat_metrics(body.get("days", 7)))
             return self.send_json({"error": "not found"}, 404)
         except Exception as exc:
             return self.send_json({"ok": False, "error": redact_sensitive(exc)}, 400)
@@ -2880,7 +3242,7 @@ def main() -> None:
     seed_local_sources()
     seed_assets()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
-    print(f"Editorial Workbench running at http://{HOST}:{PORT}")
+    print(f"WeChat Content Production Workbench running at http://{HOST}:{PORT}")
     print(f"Local data: {DB_PATH}")
     server.serve_forever()
 

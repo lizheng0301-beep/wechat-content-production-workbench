@@ -1,11 +1,18 @@
 .workbench/
 __pycache__/
 .env
+.env.*
+*.env
+!.env.example
 .DS_Store
+*.log
+.pytest_cache/
+.mypy_cache/
 
 # 本地内容数据：文章、来源卡、质检报告和素材清单不进入公开仓库
 /*.md
 !/README.md
+!/THIRD_PARTY_NOTICES.md
 /*.docx
 
 # 本地生成或导入的图片、视频与素材目录
