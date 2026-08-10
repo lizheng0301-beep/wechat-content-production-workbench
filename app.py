@@ -19,6 +19,7 @@ import re
 import socket
 import ssl
 import struct
+import subprocess
 import sqlite3
 import sys
 import tempfile
@@ -75,7 +76,7 @@ def json_bytes(value: object) -> bytes:
 
 def redact_sensitive(value: object) -> str:
     message = str(value)
-    for env_name in ("OPENAI_API_KEY", "DEEPSEEK_API_KEY", "RIGHTCODE_API_KEY", "RIGHT_CODE_API_KEY", "WECHAT_APP_SECRET", "WECHAT_APP_ID"):
+    for env_name in ("OPENAI_API_KEY", "DEEPSEEK_API_KEY", "YUZAPI_API_KEY", "YUZ_API_KEY", "RIGHTCODE_API_KEY", "RIGHT_CODE_API_KEY", "WECHAT_APP_SECRET", "WECHAT_APP_ID"):
         secret = os.getenv(env_name, "")
         if secret:
             message = message.replace(secret, "[redacted]")
@@ -202,11 +203,12 @@ def init_db() -> None:
             """
         )
         draft_columns = {row[1] for row in conn.execute("PRAGMA table_info(draft)").fetchall()}
-        for column, definition in (("title_candidates", "TEXT DEFAULT '[]'"), ("claims", "TEXT DEFAULT '[]'"), ("length_preset", "TEXT DEFAULT 'standard'"), ("style_profile_id", "INTEGER")):
+        for column, definition in (("title_candidates", "TEXT DEFAULT '[]'"), ("claims", "TEXT DEFAULT '[]'"), ("length_preset", "TEXT DEFAULT 'standard'"), ("style_profile_id", "INTEGER"),
+                                   ("model_provider", "TEXT DEFAULT ''"), ("model_name", "TEXT DEFAULT ''"), ("model_fallback", "INTEGER DEFAULT 0"), ("model_note", "TEXT DEFAULT ''")):
             if column not in draft_columns:
                 conn.execute(f"ALTER TABLE draft ADD COLUMN {column} {definition}")
         asset_columns = {row[1] for row in conn.execute("PRAGMA table_info(asset)").fetchall()}
-        for column, definition in (("source_page_url", "TEXT DEFAULT ''"), ("source_kind", "TEXT DEFAULT 'unknown'")):
+        for column, definition in (("source_page_url", "TEXT DEFAULT ''"), ("source_kind", "TEXT DEFAULT 'unknown'"), ("source_scope", "TEXT DEFAULT ''")):
             if column not in asset_columns:
                 conn.execute(f"ALTER TABLE asset ADD COLUMN {column} {definition}")
 
@@ -395,7 +397,12 @@ def http_json(url: str, method: str = "GET", payload: dict | None = None, header
             data = {"error": {"message": redact_sensitive(str(data))}}
         return exc.code, data, dict(exc.headers.items())
     except Exception as exc:
-        return 0, {"error": redact_sensitive(exc)}, {}
+        # Keep the exception class in the diagnostic.  A bare socket timeout
+        # often has an empty string on macOS, which used to surface only as
+        # “模型请求失败” and made a provider outage look like bad JSON.
+        detail = str(exc).strip()
+        detail = f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+        return 0, {"error": redact_sensitive(detail)}, {}
 
 
 def sync_aihot(window: str = "24h", category: str = "") -> dict:
@@ -554,24 +561,174 @@ def trim_body_to_budget(body: str, length_preset: str = "standard") -> str:
     return "\n\n".join(kept)
 
 
-def read_text_model(prompt: str, system: str = "") -> tuple[bool, str, str]:
-    api_key = os.getenv("OPENAI_API_KEY", "") or os.getenv("DEEPSEEK_API_KEY", "")
-    if not api_key:
-        return False, "", "未配置 OPENAI_API_KEY 或 DEEPSEEK_API_KEY，已使用本地协作模板"
-    if os.getenv("OPENAI_API_KEY"):
-        base = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-        model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+def text_model_configured() -> bool:
+    return bool(os.getenv("RIGHTCODE_API_KEY") or os.getenv("RIGHT_CODE_API_KEY") or
+                os.getenv("YUZAPI_API_KEY") or os.getenv("YUZ_API_KEY") or
+                os.getenv("OPENAI_API_KEY") or os.getenv("DEEPSEEK_API_KEY"))
+
+
+def active_text_model() -> tuple[str, str]:
+    if os.getenv("RIGHTCODE_API_KEY", "") or os.getenv("RIGHT_CODE_API_KEY", ""):
+        return "Right Code", os.getenv("RIGHTCODE_TEXT_MODEL", os.getenv("RIGHTCODE_MODEL", "gpt-5.6-sol")).strip() or "gpt-5.6-sol"
+    if os.getenv("YUZAPI_API_KEY", "") or os.getenv("YUZ_API_KEY", ""):
+        return "YuzAPI", os.getenv("YUZAPI_MODEL", "gpt-5.6-sol").strip() or "gpt-5.6-sol"
+    if os.getenv("OPENAI_API_KEY", ""):
+        return "OpenAI", os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
+    if os.getenv("DEEPSEEK_API_KEY", ""):
+        return "DeepSeek", os.getenv("DEEPSEEK_MODEL", "deepseek-chat").strip() or "deepseek-chat"
+    return "未配置", ""
+
+
+TEXT_MODEL_STATE = threading.local()
+TRANSIENT_MODEL_MARKERS = ("temporarily unavailable", "service unavailable", "ssl", "bad record mac", "decryption_failed",
+                           "timed out", "timeout", "connection reset", "broken pipe", "remote end closed")
+
+
+def text_model_state() -> dict:
+    return getattr(TEXT_MODEL_STATE, "value", {"provider": "", "model": "", "fallback": False, "primary_error": ""})
+
+
+def set_text_model_state(provider: str, model: str, fallback: bool = False, primary_error: str = "") -> None:
+    TEXT_MODEL_STATE.value = {"provider": provider, "model": model, "fallback": bool(fallback), "primary_error": primary_error}
+
+
+def model_candidates() -> list[dict]:
+    candidates: list[dict] = []
+    rightcode_key = os.getenv("RIGHTCODE_API_KEY", "") or os.getenv("RIGHT_CODE_API_KEY", "")
+    if rightcode_key:
+        candidates.append({"provider": "Right Code", "model": os.getenv("RIGHTCODE_TEXT_MODEL", os.getenv("RIGHTCODE_MODEL", "gpt-5.6-sol")).strip() or "gpt-5.6-sol",
+                           "base": os.getenv("RIGHTCODE_TEXT_BASE_URL", "https://www.rightapi.ai/codex/v1").rstrip("/"),
+                           "key": rightcode_key, "primary": True})
+    yuzapi_key = os.getenv("YUZAPI_API_KEY", "") or os.getenv("YUZ_API_KEY", "")
+    if yuzapi_key:
+        candidates.append({"provider": "YuzAPI", "model": os.getenv("YUZAPI_MODEL", "gpt-5.6-sol").strip() or "gpt-5.6-sol",
+                           "base": os.getenv("YUZAPI_BASE_URL", "https://yuzapi.fun/v1").rstrip("/"), "key": yuzapi_key,
+                           "primary": True})
+    if os.getenv("OPENAI_API_KEY", ""):
+        candidates.append({"provider": "OpenAI 兼容", "model": os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini",
+                           "base": os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/"),
+                           "key": os.getenv("OPENAI_API_KEY", ""), "primary": not bool(yuzapi_key)})
+    if os.getenv("DEEPSEEK_API_KEY", ""):
+        candidates.append({"provider": "DeepSeek", "model": os.getenv("DEEPSEEK_MODEL", "deepseek-chat").strip() or "deepseek-chat",
+                           "base": os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/"),
+                           "key": os.getenv("DEEPSEEK_API_KEY", ""), "primary": not bool(yuzapi_key) and not bool(os.getenv("OPENAI_API_KEY", ""))})
+    unique: list[dict] = []
+    seen = set()
+    for candidate in candidates:
+        marker = (candidate["base"], candidate["model"], candidate["key"])
+        if marker not in seen:
+            unique.append(candidate)
+            seen.add(marker)
+    return unique
+
+
+def request_text_candidate(candidate: dict, prompt: str, system: str, retries: int, timeout_seconds: int | None = None) -> tuple[bool, str, str, int]:
+    provider = candidate["provider"]
+    base = candidate["base"]
+    model = candidate["model"]
+    if provider == "Right Code":
+        # Right Code's chat compatibility layer replaces system instructions;
+        # put the editorial rules in the user message so they remain effective.
+        user_content = f"内部编辑要求：\n{system}\n\n具体任务：\n{prompt}"
+        messages = [{"role": "user", "content": user_content}]
     else:
-        base = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
-        model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
-    payload = {"model": model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}], "temperature": 0.7}
-    if "deepseek.com" in base:
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
+    payload = {"model": model, "messages": messages, "temperature": 0.7}
+    if "deepseek.com" in base or (provider == "YuzAPI" and os.getenv("YUZAPI_JSON_MODE", "").strip().lower() in {"1", "true", "yes", "on"}) or (provider == "Right Code" and os.getenv("RIGHTCODE_JSON_MODE", "").strip().lower() in {"1", "true", "yes", "on"}):
         payload["response_format"] = {"type": "json_object"}
-    status, data, _ = http_json(base + "/chat/completions", method="POST", payload=payload, headers={"Authorization": "Bearer " + api_key}, timeout=90)
-    if status and data.get("choices"):
-        content = data["choices"][0].get("message", {}).get("content", "")
+    if provider == "YuzAPI" and os.getenv("YUZAPI_OMIT_TEMPERATURE", "").strip().lower() in {"1", "true", "yes", "on"}:
+        payload.pop("temperature", None)
+    request_headers = {"Authorization": "Bearer " + candidate["key"], "Connection": "close"}
+    if timeout_seconds is None:
+        # gpt-5.6-sol can spend longer on a grounded long-form JSON response.
+        # Keep the browser request window below 165s while giving the primary
+        # provider enough time to finish once; timeout failures are not sent
+        # again with the same large prompt.
+        default_timeout = "90" if provider == "Right Code" else "45"
+        timeout_value = os.getenv("RIGHTCODE_TEXT_TIMEOUT", default_timeout) if provider == "Right Code" else os.getenv("TEXT_MODEL_TIMEOUT", default_timeout)
+    else:
+        timeout_value = str(timeout_seconds)
+    timeout = max(20, min(120, int(timeout_value or 45)))
+    status, data, error = 0, {}, "模型请求失败"
+    for attempt in range(retries):
+        status, data, _ = http_json(base + "/chat/completions", method="POST", payload=payload, headers=request_headers, timeout=timeout)
+        if status and data.get("choices"):
+            content = data["choices"][0].get("message", {}).get("content", "")
+            if isinstance(content, list):
+                content = "".join(str(part.get("text", "")) if isinstance(part, dict) else str(part) for part in content)
+            return True, str(content), "", status
+        error = data.get("error", {}).get("message", "模型请求失败") if isinstance(data.get("error"), dict) else str(data.get("error", "模型请求失败"))
+        retryable = status == 0 or 500 <= status < 600
+        # A long model response timing out is not made more likely to finish by
+        # sending the same large article prompt again. Keep retries for HTTP
+        # 5xx and connection failures, but let the caller try a backup once.
+        timed_out = "timed out" in error.lower() or "timeout" in error.lower()
+        if attempt + 1 < retries and retryable and not timed_out and (status != 0 or any(marker in error.lower() for marker in TRANSIENT_MODEL_MARKERS)):
+            time.sleep(1.2)
+            continue
+        break
+    return False, "", f"{provider} {model} 请求失败：{error}", status
+
+
+def read_text_model(prompt: str, system: str = "") -> tuple[bool, str, str]:
+    candidates = model_candidates()
+    set_text_model_state("", "", False, "")
+    if not candidates:
+        return False, "", "未配置 YUZAPI_API_KEY、OPENAI_API_KEY 或 DEEPSEEK_API_KEY"
+    fallback_enabled = os.getenv("YUZAPI_FALLBACK_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+    primary = candidates[0]
+    ok, content, error, status = request_text_candidate(primary, prompt, system, retries=2)
+    if ok:
+        set_text_model_state(primary["provider"], primary["model"])
         return True, content, ""
-    return False, "", data.get("error", {}).get("message", "模型请求失败") if isinstance(data.get("error"), dict) else str(data.get("error", "模型请求失败"))
+    transient = status == 0 or 500 <= status < 600 or any(marker in error.lower() for marker in TRANSIENT_MODEL_MARKERS)
+    if fallback_enabled and transient and len(candidates) > 1:
+        # Use one configured backup within the browser's 165s request window.
+        for backup in candidates[1:2]:
+            fallback_timeout = max(20, min(45, int(os.getenv("TEXT_MODEL_FALLBACK_TIMEOUT", "45") or 45)))
+            backup_ok, backup_content, backup_error, _ = request_text_candidate(backup, prompt, system, retries=1, timeout_seconds=fallback_timeout)
+            if backup_ok:
+                set_text_model_state(backup["provider"], backup["model"], True, error)
+                return True, backup_content, ""
+            error = f"{error}；备用模型 {backup_error}"
+    set_text_model_state(primary["provider"], primary["model"], False, error)
+    return False, "", error
+
+
+def extract_json_object(value: str) -> dict | None:
+    """Extract the first valid JSON object, including fenced model responses."""
+    decoder = json.JSONDecoder()
+    text = str(value or "").strip()
+    for index, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            parsed, _ = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def writing_style_context(provider: str) -> tuple[str, str]:
+    """Return enough style evidence without making long requests fragile.
+
+    Right Code is the preferred long-form provider, but its compatibility
+    endpoint is more sensitive to oversized prompts. The explicit rules in
+    generate_draft carry the non-negotiable constraints, so the external skill
+    excerpt and historical samples can be smaller without losing the voice.
+    """
+    if provider == "Right Code":
+        skill_limit, sample_count, sample_limit = 4200, 3, 650
+    else:
+        skill_limit, sample_count, sample_limit = 7000, 5, 900
+    skill_excerpt = str(STYLE_CONTEXT.get("skill_excerpt", ""))[:skill_limit]
+    samples = "\n\n".join(
+        f"样本 {sample.get('name', '')}\n{sample.get('excerpt', '')[:sample_limit]}"
+        for sample in STYLE_CONTEXT.get("samples", [])[:sample_count]
+    )
+    return skill_excerpt, samples
 
 
 def local_draft(topic: dict, source: dict | None, length_preset: str = "standard") -> dict:
@@ -650,43 +807,268 @@ def local_draft(topic: dict, source: dict | None, length_preset: str = "standard
             "mode": "local_template", "length_preset": normalize_length_preset(length_preset)}
 
 
+def split_readability_paragraph(block: str, target: int = 92, hard_limit: int = 118) -> list[str]:
+    """Split a dense paragraph only at sentence boundaries.
+
+    The characters are left untouched; only blank-line boundaries are added.
+    This gives WeChat's narrow reading column some air without turning every
+    sentence into a separate social-media caption.
+    """
+    plain = markdown_text_only(block)
+    if (len(plain) <= hard_limit or "http://" in block or "https://" in block
+            or block.startswith(("!", "#", ">", "- ", "* ")) or re.match(r"^\d+[.)]\s+", block)):
+        return [block]
+    sentences = [item for item in re.split(r"(?<=[。！？!?；;])", block) if item.strip()]
+    if len(sentences) < 2:
+        return [block]
+    chunks: list[str] = []
+    current = ""
+    for sentence in sentences:
+        sentence = sentence.strip()
+        candidate = current + sentence
+        if current and len(markdown_text_only(candidate)) > target:
+            chunks.append(current)
+            current = sentence
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    if len(chunks) > 1 and len(markdown_text_only(chunks[-1])) < 24:
+        combined = chunks[-2] + chunks[-1]
+        if len(markdown_text_only(combined)) <= hard_limit:
+            chunks[-2:] = [combined]
+    if any(chunk.count(marker) % 2 for chunk in chunks for marker in ("**", "==", "__", "^^", "`")):
+        return [block]
+    return chunks if len(chunks) > 1 else [block]
+
+
 def local_readability_markup(markdown: str) -> str:
-    blocks = [block.strip() for block in re.split(r"\n\s*\n", markdown or "") if block.strip()]
-    plain_length = len(markdown_text_only(markdown))
-    mark_budget = max(4, min(10, plain_length // 400 + 1))
-    candidates: list[tuple[int, int, str, str]] = []
-    for index, block in enumerate(blocks):
-        if block.startswith(("#", ">", "!", "- ", "* ")) or re.match(r"^\d+[.)] ", block):
+    raw_blocks = [block.strip() for block in re.split(r"\n\s*\n", markdown or "") if block.strip()]
+    if not raw_blocks:
+        return markdown
+
+    # Rebuild the editorial layer on every pass. This avoids accumulating old
+    # headings or emphasis when the user clicks “整理重点” more than once.
+    blocks: list[str] = []
+    heading_hints: dict[int, int] = {}
+    for raw in raw_blocks:
+        block = raw.strip()
+        if re.fullmatch(r"!\[[^\]]*\]\([^)]+\)", block) or block == "---":
+            blocks.append(block)
             continue
-        if any(token in block for token in ("**", "==", "__", "^^")):
+        heading_match = re.match(r"^(#{2,3})\s+", block)
+        heading_level = 0
+        if heading_match:
+            heading_level = len(heading_match.group(1))
+            block = block[heading_match.end():].strip()
+        was_callout = bool(re.match(r"^>\s*", block))
+        block = re.sub(r"^#\s+", "", block)
+        block = re.sub(r"^>\s*(?:\[(?:引言|方法|技巧|风险|金句)\]\s*)?", "", block)
+        block = re.sub(r"\*\*([^*]+)\*\*", r"\1", block)
+        block = re.sub(r"==([^=]+)==", r"\1", block)
+        block = re.sub(r"__([^_]+)__", r"\1", block)
+        block = re.sub(r"\^\^([^\^]+)\^\^", r"\1", block)
+        pieces = [block.strip()] if was_callout or heading_level else split_readability_paragraph(block.strip())
+        if heading_level:
+            heading_hints[len(blocks)] = heading_level
+        blocks.extend(pieces)
+
+    def is_special(index: int) -> bool:
+        block = blocks[index]
+        return bool(not block or block == "---" or block.startswith(("!", "- ", "* "))
+                    or re.match(r"^\d+[.)]\s+", block))
+
+    text_indices = [index for index in range(len(blocks)) if not is_special(index)]
+    if not text_indices:
+        return markdown
+    lead_index = text_indices[0]
+    lengths = [len(markdown_text_only(block)) for block in blocks]
+    total_length = max(1, sum(lengths))
+    positions: list[int] = []
+    running = 0
+    for length in lengths:
+        positions.append(running)
+        running += length
+
+    # Candidate headings reuse a short standalone paragraph or the first
+    # sentence of a longer paragraph. They are selected around article thirds,
+    # instead of greedily turning the first four short sentences into headings.
+    heading_candidates: list[dict] = []
+    for index in text_indices:
+        if index == lead_index:
+            continue
+        block = blocks[index]
+        plain = markdown_text_only(block)
+        if "http://" in block or "https://" in block:
             continue
         sentences = [item.strip() for item in re.split(r"(?<=[。！？!?])", block) if item.strip()]
-        for sentence in sentences:
-            plain_sentence = markdown_text_only(sentence)
-            if not 8 <= len(plain_sentence) <= 55:
-                continue
-            if re.search(r"(?:你可以|可以先|建议先|具体做法|我的做法|记住|最简单的办法|先[^。！？]{1,12}再)", sentence):
-                candidates.append((index, 4, "__", sentence))
-            elif re.search(r"(?:真正重要|关键在于|我更在意|问题不在|我自己的判断|所以，)", sentence):
-                candidates.append((index, 3, "**", sentence))
-            elif re.search(r"(?:不要|别急|需要注意|风险|小心|不能完全)", sentence):
-                candidates.append((index, 2, "^^", sentence))
-            elif "「" in sentence and "」" in sentence:
-                candidates.append((index, 1, "==", sentence))
-    candidates.sort(key=lambda item: (-item[1], item[0]))
-    selected: list[tuple[int, str, str]] = []
-    used_blocks: set[int] = set()
-    for index, _, marker, sentence in candidates:
-        if len(selected) >= mark_budget:
-            break
-        if index in used_blocks and len(selected) < mark_budget - 2:
+        heading = ""
+        remainder = ""
+        if 9 <= len(plain) <= 58:
+            heading = block
+        elif len(sentences) >= 2 and 10 <= len(markdown_text_only(sentences[0])) <= 42:
+            heading = sentences[0]
+            remainder = block[len(sentences[0]):].strip()
+        if not heading:
             continue
-        selected.append((index, marker, sentence))
-        used_blocks.add(index)
-    for index, marker, sentence in sorted(selected, key=lambda item: item[0], reverse=True):
-        replacement = f"{marker}{sentence}{marker}"
-        blocks[index] = blocks[index].replace(sentence, replacement, 1)
-    return "\n\n".join(blocks)
+        signal = 1
+        if re.search(r"(?:真正|关键|问题|不是|而是|为什么|普通人|更重要|变化|难的是|值得)", heading):
+            signal += 2
+        if index in heading_hints:
+            signal += 1
+        heading_candidates.append({"index": index, "heading": heading, "remainder": remainder,
+                                   "position": positions[index], "signal": signal})
+
+    if total_length < 1500:
+        h2_targets = [0.18, 0.62]
+    elif total_length < 3200:
+        h2_targets = [0.12, 0.43, 0.74]
+    else:
+        h2_targets = [0.10, 0.34, 0.60, 0.83]
+    h2_choices: list[dict] = []
+    used_heading_indices: set[int] = set()
+    minimum_gap = max(180, int(total_length * 0.16))
+    for fraction in h2_targets:
+        target = total_length * fraction
+        available = [candidate for candidate in heading_candidates
+                     if candidate["index"] not in used_heading_indices
+                     and all(abs(candidate["position"] - selected["position"]) >= minimum_gap for selected in h2_choices)]
+        if not available:
+            continue
+        selected = min(available, key=lambda candidate: abs(candidate["position"] - target) - candidate["signal"] * 24)
+        h2_choices.append(selected)
+        used_heading_indices.add(selected["index"])
+
+    # One or two quieter subheads create hierarchy inside the main sections.
+    h3_choices: list[dict] = []
+    for fraction in ([0.28, 0.58] if total_length >= 1800 else [0.46]):
+        target = total_length * fraction
+        available = [candidate for candidate in heading_candidates
+                     if candidate["index"] not in used_heading_indices
+                     and all(abs(candidate["position"] - selected["position"]) >= max(120, minimum_gap // 2)
+                             for selected in h2_choices + h3_choices)]
+        if not available:
+            continue
+        selected = min(available, key=lambda candidate: abs(candidate["position"] - target) - candidate["signal"] * 16)
+        h3_choices.append(selected)
+        used_heading_indices.add(selected["index"])
+
+    h2_map = {choice["index"]: choice for choice in h2_choices}
+    h3_map = {choice["index"]: choice for choice in h3_choices}
+
+    # Long articles need more than an opening frame. Pick two or three existing
+    # paragraphs as distributed visual anchors, preferring real methods, risks
+    # and concise judgments. No copy is invented for decoration.
+    if total_length < 1500:
+        callout_targets = [0.58]
+    elif total_length < 2800:
+        callout_targets = [0.34, 0.69]
+    else:
+        callout_targets = [0.27, 0.55, 0.80]
+    callout_candidates: list[dict] = []
+    for index in text_indices:
+        if index == lead_index or index in used_heading_indices or positions[index] < total_length * 0.16:
+            continue
+        plain = markdown_text_only(blocks[index])
+        if not 14 <= len(plain) <= 145 or "http" in plain:
+            continue
+        label, signal = "", 0
+        if re.search(r"(?:不要|(?<!能)不能|别急|风险|小心|边界|还不能|需要注意)", plain):
+            label, signal = "风险", 5
+        elif re.search(r"(?:最稳妥|可以先|具体做法|建议|先.{1,18}再|最简单的办法|只需要)", plain):
+            label, signal = "方法", 5
+        elif len(plain) <= 82 and re.search(r"(?:真正|关键|问题不在|不是.{1,30}而是|我更在意|更重要|难的是|才是|值得)", plain):
+            label, signal = "金句", 4
+        elif len(plain) <= 58:
+            label, signal = "金句", 1
+        if label:
+            callout_candidates.append({"index": index, "label": label, "position": positions[index], "signal": signal})
+
+    callout_choices: list[dict] = []
+    used_callout_indices: set[int] = set()
+    callout_gap = max(170, int(total_length * .16))
+    heading_positions_selected = [choice["position"] for choice in h2_choices + h3_choices]
+    for fraction in callout_targets:
+        target = total_length * fraction
+        available = [candidate for candidate in callout_candidates
+                     if candidate["index"] not in used_callout_indices
+                     and all(abs(candidate["position"] - selected["position"]) >= callout_gap for selected in callout_choices)
+                     and all(abs(candidate["position"] - heading_position) >= 80 for heading_position in heading_positions_selected)]
+        if not available:
+            available = [candidate for candidate in callout_candidates
+                         if candidate["index"] not in used_callout_indices
+                         and all(abs(candidate["position"] - selected["position"]) >= callout_gap for selected in callout_choices)]
+        if not available:
+            continue
+        selected = min(available, key=lambda candidate: abs(candidate["position"] - target) - candidate["signal"] * 38)
+        callout_choices.append(selected)
+        used_callout_indices.add(selected["index"])
+    callout_map = {choice["index"]: choice["label"] for choice in callout_choices}
+
+    reserved = {lead_index, *used_heading_indices}
+    reserved.update(used_callout_indices)
+
+    # Spread emphasis over the whole article. Method, risk and judgment use
+    # different markers so bold/highlight/underline/color have real meaning.
+    emphasis_candidates: list[dict] = []
+    for index in text_indices:
+        if index in reserved:
+            continue
+        for sentence in [item.strip() for item in re.split(r"(?<=[。！？!?])", blocks[index]) if item.strip()]:
+            plain = markdown_text_only(sentence)
+            if not 10 <= len(plain) <= 58 or "http" in sentence:
+                continue
+            kind, score = "judgement", 1
+            if re.search(r"(?:最稳妥|可以先|具体做法|建议|只需要|先.{1,18}再|最简单)", sentence):
+                kind, score = "method", 5
+            elif re.search(r"(?:不要|(?<!能)不能|别急|风险|小心|边界|还不能|需要注意)", sentence):
+                kind, score = "risk", 5
+            elif re.search(r"(?:真正|关键|问题不在|不是.{1,30}而是|我更在意|更重要|决定.{1,20}不是)", sentence):
+                kind, score = "judgement", 4
+            elif re.search(r"(?:但|却|普通人|难的是|值得)", sentence):
+                score = 2
+            emphasis_candidates.append({"index": index, "sentence": sentence, "position": positions[index],
+                                        "kind": kind, "score": score})
+
+    emphasis_budget = max(4, min(7, total_length // 500 + 2))
+    emphasis_targets = [(slot + 1) / (emphasis_budget + 1) for slot in range(emphasis_budget)]
+    selected_emphasis: list[dict] = []
+    used_emphasis_blocks: set[int] = set()
+    for fraction in emphasis_targets:
+        target = total_length * fraction
+        available = [candidate for candidate in emphasis_candidates if candidate["index"] not in used_emphasis_blocks]
+        if not available:
+            break
+        selected = min(available, key=lambda candidate: abs(candidate["position"] - target) - candidate["score"] * 34)
+        selected_emphasis.append(selected)
+        used_emphasis_blocks.add(selected["index"])
+
+    judgement_index = 0
+    for selected in selected_emphasis:
+        marker = "__" if selected["kind"] == "method" else "^^" if selected["kind"] == "risk" else ("**" if judgement_index % 2 == 0 else "==")
+        if selected["kind"] == "judgement":
+            judgement_index += 1
+        sentence = selected["sentence"]
+        blocks[selected["index"]] = blocks[selected["index"]].replace(sentence, f"{marker}{sentence}{marker}", 1)
+
+    structured: list[str] = []
+    for index, block in enumerate(blocks):
+        if index == lead_index:
+            structured.append(f"> [引言] {block}")
+            continue
+        choice = h2_map.get(index) or h3_map.get(index)
+        if choice:
+            prefix = "##" if index in h2_map else "###"
+            structured.append(f"{prefix} {choice['heading']}")
+            if choice["remainder"]:
+                structured.append(choice["remainder"])
+            continue
+        if index in callout_map:
+            structured.append(f"> [{callout_map[index]}] {block}")
+            continue
+        structured.append(block)
+    rendered = "\n\n".join(structured)
+    return rendered if layout_plain_text(rendered) == layout_plain_text(markdown) else markdown
 
 
 def grounded_personal_passage(topic: dict) -> str:
@@ -712,36 +1094,80 @@ def normalize_body_placeholders(body: str, topic: dict) -> str:
     normalized = body
     for pattern in patterns:
         normalized = re.sub(pattern, fallback, normalized)
-    normalized = re.sub(r"^#{1,6}\s+", "", normalized, flags=re.M)
+    # Keep h2/h3 markers for the later layout pass. A leading h1 would repeat
+    # the separate WeChat article title, so only flatten that level here.
+    normalized = re.sub(r"^#\s+", "", normalized, flags=re.M)
     return normalized.replace("发布前请回到原文核验事实，并把真实经历补回文章。", "发布前请回到原文核验事实，作者判断和推断已经分开写清楚。")
 
 
+def layout_plain_text(value: str) -> str:
+    """Compare layout output by content, ignoring Markdown control syntax."""
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", value or "")
+    text = re.sub(r"(?m)^\s*#{1,6}\s+", "", text)
+    text = re.sub(r"(?m)^\s*>\s*", "", text)
+    text = re.sub(r"(?m)^\s*(?:\[[^\]]+\]|引言|方法|技巧|风险|金句)\s*(?:[|｜:：]\s*)?", "", text)
+    text = re.sub(r"(?m)^\s*(?:[-*]|\d+[.)])\s+", "", text)
+    text = re.sub(r"\[([^\]]+)\]\((?:https?://)?[^)]+\)", r"\1", text)
+    text = re.sub(r"[*_`=~^]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    # Promoting the first sentence of a paragraph into a heading introduces a
+    # block boundary after Chinese punctuation. Treat that whitespace as
+    # layout-only so the no-rewrite guard still verifies the actual wording.
+    return re.sub(r"(?<=[。！？!?])\s+(?=[\u3400-\u9fffA-Za-z0-9])", "", text)
+
+
 def readability_markup(markdown: str, title: str = "") -> dict:
-    prompt = f"""你是公众号排版编辑。只给下面这篇 Markdown 正文增加少量可读性标记，不得改写、删减、补造或调换任何文字。
-允许的标记只有：**重点加粗**、==重点高亮==、__重点下划线__、^^朱砂强调色^^。
-    全文只标记 4 到 10 处，优先标记结论、转折、关键判断、方法和风险提醒，不要整段加粗，不要给标题加标记。
-输出 JSON，只有一个字段 body。
+    plain_length = len(markdown_text_only(markdown))
+    mark_budget = max(4, min(10, plain_length // 400 + 1))
+    support_box_count = 1 if plain_length < 1500 else 2 if plain_length < 2800 else 3
+    prompt = f"""你是公众号排版总编，负责把一篇已经写完的 Markdown 正文校准成可读版式。
+只允许给原文已有的句子增加 Markdown 结构标记，不得改写、删减、补造、拆散或调换任何文字。
+允许的块级标记只有：
+- `## 原文已有的一整句`，表示一级正文小节标题
+- `### 原文已有的一整句`，表示二级正文小节标题
+- `> [引言] 原文已有的一整句`，表示开头引言
+- `> [方法] 原文已有的一整句` 或 `> [技巧] 原文已有的一整句`，表示可执行方法
+- `> [风险] 原文已有的一整句`，表示风险提醒
+- `> [金句] 原文已有的一整句`，表示值得停顿的判断
+控制词 `[引言]`、`[方法]`、`[技巧]`、`[风险]`、`[金句]` 不属于正文，不要改变后面的原句。
+允许的行内标记只有：**重点加粗**、==重点高亮==、__重点下划线__、^^朱砂强调色^^。
+全文重点标记总数控制在 {max(4, min(10, mark_budget))} 处，不要整段标记。方法、技巧优先下划线，金句优先加粗或高亮，风险优先朱砂强调。
+正文超过 1200 字时使用 2 到 4 个 `##`，并分布在前段、中段和后段；`###` 只用于一级小节内部，最多 2 个，不要把前几段连续做成标题。不要输出 `#` 一级标题，文章标题由公众号标题栏负责。
+第一段使用一个 `[引言]`，全文再选 {support_box_count} 个方法、风险或金句框，分散放在长段文字之间作为阅读锚点。优先保留语义差异，不要连续使用装饰块，不要把每个段落都做成框。
+普通正文每段控制在 1 到 3 句、约 45 到 100 个中文字符，最长不超过 120 字。只允许在原文句号、问号、感叹号或分号后增加空行，不得删字、换字或把每句话都拆成独立段落。
+输出 JSON，只有一个字段 body，body 必须是完整正文。
 
 文章标题：{title}
 正文：
 {markdown}
 """
-    ok, text, error = read_text_model(prompt, "你是一名克制的公众号排版编辑，只做信息层级，不改变作者原文。")
+    ok, text, error = read_text_model(prompt, "你是一名克制的公众号排版总编，只做结构和重点标记，不改变作者原文。")
     if ok:
-        match = re.search(r"\{.*\}", text, re.S)
-        if match:
-            try:
-                result = json.loads(match.group(0))
-                body = str(result.get("body", "")).strip()
-                mark_count = len(re.findall(r"\*\*[^*]+\*\*|==[^=]+==|__[^_]+__|\^\^[^\^]+\^\^", body))
-                plain_length = len(markdown_text_only(markdown))
-                mark_budget = max(4, min(10, plain_length // 400 + 1))
-                minimum_marks = max(4, min(6, plain_length // 700 + 2))
-                if body and len(markdown_text_only(body)) == plain_length and minimum_marks <= mark_count <= mark_budget:
-                    return {"body": body, "mode": "model", "message": "已整理重点层级，原文内容未改动"}
-            except json.JSONDecodeError:
-                pass
-    return {"body": local_readability_markup(markdown), "mode": "local_fallback", "message": error or "已用本地规则整理少量重点"}
+        result = extract_json_object(text)
+        if result:
+            body = str(result.get("body", "")).strip()
+            mark_count = len(re.findall(r"\*\*[^*]+\*\*|==[^=]+==|__[^_]+__|\^\^[^\^]+\^\^", body))
+            minimum_marks = max(4, min(6, plain_length // 700 + 2))
+            h1_count = len(re.findall(r"(?m)^#\s+", body))
+            h2_count = len(re.findall(r"(?m)^##\s+", body))
+            h3_count = len(re.findall(r"(?m)^###\s+", body))
+            control_count = len(re.findall(r"(?m)^>\s+\[(?:引言|方法|技巧|风险|金句)\]", body))
+            normal_blocks = [block.strip() for block in re.split(r"\n\s*\n", body) if block.strip()
+                             and not block.lstrip().startswith(("!", "#", ">", "- ", "* "))
+                             and not re.match(r"^\d+[.)]\s+", block.lstrip())]
+            dense_paragraphs = [block for block in normal_blocks if len(markdown_text_only(block)) > 120]
+            heading_positions = [match.start() for match in re.finditer(r"(?m)^#{2,3}\s+", body)]
+            heading_spread = (len(heading_positions) >= 2 and heading_positions[-1] - heading_positions[0] >= len(body) * .38)
+            minimum_h2 = 2 if plain_length >= 1200 else 1
+            expected_callouts = 1 + support_box_count
+            if (body and layout_plain_text(body) == layout_plain_text(markdown)
+                    and h1_count == 0 and minimum_h2 <= h2_count <= 4 and h3_count <= 2
+                    and control_count == expected_callouts and heading_spread
+                    and not dense_paragraphs
+                    and minimum_marks <= mark_count <= mark_budget):
+                return {"body": body, "mode": "model", "message": "5.6 Sol 已校准章节框、语义框与重点层级，正文内容未改动",
+                        "layout": {"h2": h2_count, "h3": h3_count, "callouts": control_count, "emphasis": mark_count}}
+    return {"body": local_readability_markup(markdown), "mode": "local_fallback", "message": error or "模型排版未通过校验，已用本地规则补齐章节框、语义框与重点层级"}
 
 
 def generate_draft(draft_id: int, length_preset: str | None = None) -> dict:
@@ -755,9 +1181,11 @@ def generate_draft(draft_id: int, length_preset: str | None = None) -> dict:
     source = row_to_json(source_row)
     length_preset = normalize_length_preset(length_preset or draft_row["length_preset"] or "standard")
     length = length_config(length_preset)
-    style_samples = "\n\n".join(f"样本 {sample.get('name', '')}\n{sample.get('excerpt', '')[:900]}" for sample in STYLE_CONTEXT.get("samples", [])[:5])
+    prompt_provider, _ = active_text_model()
+    skill_excerpt, style_samples = writing_style_context(prompt_provider)
     prompt = f"""你是数字生命卡兹克的公众号写作协作者。请基于以下资料生成一篇可以直接进入审稿的中文长文。
 严格遵守 Khazix 写作规则，文章要像一个有见识的普通人在认真聊一件打动他的事，不像报告或营销稿。正文目标为 {length['minimum']} 到 {length['maximum']} 个中文字符，至少 10 个自然段。开头从具体事件或当下场景切入，不使用教科书式开场。
+必须遵守 3s 原则，标题和开头首屏的前 3 到 5 句，要让读者在约 3 秒内知道发生了什么、矛盾或看点是什么、继续读能得到什么判断或具体帮助。不要用背景铺垫、宏大定义或空泛感受消耗首屏，第一段必须出现具体对象、动作、变化、数字、时间或可验证事实中的至少一种。
 不要编造作者没有提供或历史样本中没有出现的具体经历、数字、引语、人物、时间和测试结果。缺失第一手经历时，不要留下待补、这里应该放、等作者补充等占位符；改用已有作者观察、历史文章中已经发生的工具使用和当前工作流形成谨慎的个人判断，不把推测写成亲历事实。文章必须完整结束。
 除非文章本身是方法论分条，不使用 Markdown 二级标题，不用项目符号堆成提纲。靠口语化转场、短段落、疑问句和少量断裂句推进。不要使用首先、其次、最后、综上所述、值得注意的是、说白了、意味着什么、本质上、换句话说、不可否认等套话，不使用冒号、破折号和双引号。
 知识要自然地聊出来，每个核心观点都要有具体事实、场景、工具名称、数据或来源支撑，并加入对读者处境的理解、一个自然的文化或历史参照，以及结尾回扣。正文先输出普通 Markdown，不要添加加粗、高亮或下划线，重点标记由编辑部后处理。
@@ -768,20 +1196,19 @@ def generate_draft(draft_id: int, length_preset: str | None = None) -> dict:
 作者观察：{topic.get('personal_observation','')}
 真实经历：{topic.get('lived_experience','')}
 情绪节点：{topic.get('emotional_note','')}
-写作规范摘要：{STYLE_CONTEXT.get('skill_excerpt','')[:7000]}
+写作规范摘要：{skill_excerpt}
 历史文章样本摘要：{style_samples}
 作者个人补充偏好：{style_preferences()}
 """
     ok, text, error = read_text_model(prompt, "你是一名编辑部里的写作协作者，不是自动发稿机器人。")
+    writing_model = dict(text_model_state())
     result = None
     if ok:
-        match = re.search(r"\{.*\}", text, re.S)
-        if match:
-            try:
-                result = json.loads(match.group(0))
-            except json.JSONDecodeError:
-                result = None
+        result = extract_json_object(text)
     if not result:
+        if text_model_configured():
+            failure = error or "模型返回不是有效 JSON，未写入本地模板"
+            raise RuntimeError(f"{active_text_model()[0]} {active_text_model()[1]} 写作失败：{failure}")
         result = local_draft(topic, source, length_preset)
         result["model_note"] = error or "已使用本地协作模板"
     result["body"] = normalize_markdown_blocks(normalize_body_placeholders(str(result.get("body", "")), topic))
@@ -789,6 +1216,14 @@ def generate_draft(draft_id: int, length_preset: str | None = None) -> dict:
     layout = readability_markup(result["body"], str(result.get("title", "")))
     result["body"] = layout["body"]
     result["readability_mode"] = layout.get("mode", "local_fallback")
+    result["digest"] = markdown_text_only(str(result.get("digest", "")))[:120] or markdown_text_only(result["body"])[:120]
+    result["model_provider"] = writing_model.get("provider", "")
+    result["model_name"] = writing_model.get("model", "")
+    result["model_fallback"] = bool(writing_model.get("fallback"))
+    if result["model_fallback"]:
+        result["model_note"] = f"5.6 Sol 暂时不可用，已使用备用模型 {writing_model.get('provider')} {writing_model.get('model')}"
+    elif result["model_provider"]:
+        result["model_note"] = f"已使用 {result['model_provider']} {result['model_name']} 生成"
     candidates = result.get("title_candidates")
     if isinstance(candidates, str):
         candidates = [candidates]
@@ -798,16 +1233,41 @@ def generate_draft(draft_id: int, length_preset: str | None = None) -> dict:
     result["length_preset"] = length_preset
     result["quality_report"] = quality_check(result.get("body", ""), result.get("evidence", []) if isinstance(result.get("evidence"), list) else [], length_preset)
     with db_conn() as conn:
-        conn.execute("UPDATE draft SET title=?,digest=?,body=?,outline=?,evidence=?,title_candidates=?,claims=?,length_preset=?,quality_report=?,style_profile_id=?,status=?,updated_at=? WHERE id=?",
+        conn.execute("UPDATE draft SET title=?,digest=?,body=?,outline=?,evidence=?,title_candidates=?,claims=?,length_preset=?,quality_report=?,style_profile_id=?,model_provider=?,model_name=?,model_fallback=?,model_note=?,status=?,updated_at=? WHERE id=?",
                      (result.get("title", ""), result.get("digest", ""), result.get("body", ""), json.dumps(result.get("outline", []), ensure_ascii=False),
                       json.dumps(result.get("evidence", []), ensure_ascii=False), json.dumps(result.get("title_candidates", []), ensure_ascii=False),
-                      json.dumps(result.get("claims", []), ensure_ascii=False), length_preset, json.dumps(result["quality_report"], ensure_ascii=False), current_style_profile_id(), "待审稿", now_iso(), draft_id))
+                      json.dumps(result.get("claims", []), ensure_ascii=False), length_preset, json.dumps(result["quality_report"], ensure_ascii=False), current_style_profile_id(),
+                      result.get("model_provider", ""), result.get("model_name", ""), 1 if result.get("model_fallback") else 0, result.get("model_note", ""), "待审稿", now_iso(), draft_id))
         row = conn.execute("SELECT * FROM draft WHERE id=?", (draft_id,)).fetchone()
     result["draft"] = row_to_json(row)
     return result
 
 
 FORBIDDEN_WORDS = ["说白了", "意味着什么", "这意味着", "本质上", "换句话说", "不可否认", "综上所述", "总的来说", "值得注意的是", "不难发现", "让我们来看看", "接下来让我们"]
+
+
+def three_second_content_check(body: str) -> dict:
+    """Check whether the first screen gives a reader a reason to continue."""
+    paragraphs = [markdown_text_only(p) for p in re.split(r"\n\s*\n", body or "") if markdown_text_only(p)]
+    opening = " ".join(paragraphs[:2])[:420]
+    concrete = bool(re.search(r"\d|https?://|「[^」]+」|最近|这两天|今天|昨天|刚刚|刚才|发布|上线|宣布|刷到|看到|测试|用过", opening))
+    tension = bool(re.search(r"为什么|但|却|还不能|问题|卡住|停下来|冲突|区别|真正|到底|[？?]", opening))
+    promise = bool(re.search(r"我想|先说|聊聊|看看|判断|方法|具体|你会|读完|值得|关键|答案|怎么", opening))
+    generic_start = bool(re.match(r"^(在当今|随着|近年来|伴随着|众所周知|在这个时代)", opening))
+    passed = bool(opening) and len(opening) <= 420 and concrete and tension and promise and not generic_start
+    reasons = []
+    if not opening:
+        reasons.append("缺少正文首屏")
+    if not concrete:
+        reasons.append("首屏没有具体事件、对象或可验证事实")
+    if not tension:
+        reasons.append("首屏没有冲突、疑问或明确看点")
+    if not promise:
+        reasons.append("首屏没有告诉读者继续阅读能得到什么")
+    if generic_start:
+        reasons.append("首屏从宏大背景或套话开始")
+    return {"passed": passed, "opening_chars": len(opening), "reasons": reasons,
+            "rule": "3 秒内看懂发生了什么、为什么值得继续看、能得到什么"}
 
 
 def quality_check(body: str, evidence: list | None = None, length_preset: str = "standard") -> dict:
@@ -818,6 +1278,10 @@ def quality_check(body: str, evidence: list | None = None, length_preset: str = 
     hits = {word: body.count(word) for word in FORBIDDEN_WORDS if word in body}
     punctuation = {mark: body.count(mark) for mark in ["：", "——", '"', "“", "”"] if mark in body}
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n", body or "") if p.strip()]
+    ordinary_paragraphs = [paragraph for paragraph in paragraphs if not paragraph.lstrip().startswith(("!", "#", ">", "- ", "* "))
+                           and not re.match(r"^\d+[.)]\s+", paragraph.lstrip())]
+    ordinary_lengths = [len(markdown_text_only(paragraph)) for paragraph in ordinary_paragraphs]
+    dense_paragraphs = [length for length in ordinary_lengths if length > 120]
     spoken_candidates = ["我觉得", "我自己", "说真的", "其实吧", "你想想看", "我发现", "我更在意", "我还在摸索", "太离谱了", "？？？", "= =", "。。。"]
     spoken = [x for x in spoken_candidates if x in body]
     placeholders = [x for x in ["待补", "这里应该放", "等作者补", "请作者补", "暂无摘要", "还没有把自己的观察写进去", "发布前再补"] if x in body]
@@ -826,6 +1290,8 @@ def quality_check(body: str, evidence: list | None = None, length_preset: str = 
     question_count = len(re.findall(r"[？?]", body))
     short_breaks = sum(1 for paragraph in paragraphs if len(markdown_text_only(paragraph)) <= 18)
     heading_count = len(re.findall(r"^#{1,6}\s+", body, re.M))
+    h2_count = len(re.findall(r"^##\s+", body, re.M))
+    h3_count = len(re.findall(r"^###\s+", body, re.M))
     list_count = len(re.findall(r"^(?:[-*]\s+|\d+[.)]\s+)", body, re.M))
     emphasis_count = len(re.findall(r"\*\*[^*]+\*\*|==[^=]+==|__[^_]+__|\^\^[^\^]+\^\^", body))
     emphasis_budget = max(4, min(10, len(plain) // 400 + 1))
@@ -833,22 +1299,25 @@ def quality_check(body: str, evidence: list | None = None, length_preset: str = 
     paragraph_keys = [re.sub(r"\W+", "", markdown_text_only(paragraph))[:90] for paragraph in paragraphs]
     repeated_paragraphs = len(paragraph_keys) - len(set(paragraph_keys))
     empty_expression_hits = sum(body.count(term) for term in ["很重要", "非常关键", "值得关注", "有很多可能", "带来新的机遇"])
+    three_second = three_second_content_check(body)
     length_ok = length["minimum"] <= len(plain) <= length["maximum"]
     density_ok = len(paragraphs) >= 10 and repeated_paragraphs <= max(1, len(paragraphs) // 8) and empty_expression_hits <= 3
     checks = {
         "硬性规则": not hits and not punctuation and not placeholders,
+        "3秒首屏": three_second["passed"],
         "长文长度": length_ok,
         "开头具体": bool(paragraphs) and len(markdown_text_only(paragraphs[0])) <= 180,
-        "节奏层次": short_breaks >= 2 and question_count >= 1 and all(len(markdown_text_only(p)) <= 460 for p in paragraphs),
+        "节奏层次": short_breaks >= 2 and question_count >= 1,
+        "段落呼吸": not dense_paragraphs,
         "口语与个人判断": len(spoken) >= 2 and has_personal,
         "内容支撑": len(paragraphs) >= 10 and (has_specific_detail or bool(evidence)),
         "证据链": bool(evidence),
         "信息密度": density_ok,
-        "结构克制": heading_count <= 1 and list_count <= 3,
+        "结构克制": h2_count <= 4 and h3_count <= 6 and heading_count <= 10 and list_count <= 3,
         "重点存在": emphasis_minimum <= emphasis_count <= emphasis_budget,
     }
     passed = sum(bool(value) for value in checks.values())
-    passed_ok = all(checks[key] for key in ("硬性规则", "长文长度", "内容支撑", "证据链", "信息密度", "结构克制", "重点存在")) and passed >= 9
+    passed_ok = all(checks[key] for key in ("硬性规则", "3秒首屏", "长文长度", "段落呼吸", "内容支撑", "证据链", "信息密度", "结构克制", "重点存在")) and passed >= 11
     next_actions = []
     if not length_ok:
         next_actions.append(f"正文当前 {len(plain)} 字，当前档位建议控制在 {length['minimum']} 到 {length['maximum']} 字")
@@ -858,10 +1327,14 @@ def quality_check(body: str, evidence: list | None = None, length_preset: str = 
         next_actions.append("把命中的套话或禁用标点改成具体、口语化表达")
     if not checks["节奏层次"]:
         next_actions.append("增加短句断裂和自然疑问，拆短过长段落")
+    if dense_paragraphs:
+        next_actions.append(f"有 {len(dense_paragraphs)} 个普通段落超过 120 字，请只在原句结束处拆段，避免手机端形成文字墙")
+    if not checks["3秒首屏"]:
+        next_actions.append("按 3s 原则重写首屏，先交代具体事件，再亮出冲突和读者继续阅读能得到的判断")
     if not checks["证据链"]:
         next_actions.append("至少绑定一条可回溯来源，并区分事实、判断和推断")
     if not checks["结构克制"]:
-        next_actions.append("减少 Markdown 小标题和项目符号，改用口语化转场推进")
+            next_actions.append("控制在 4 个一级小节、6 个二级小节以内，避免每段都做成标题")
     if not checks["信息密度"]:
         next_actions.append("删除重复观点和空泛表达，让每个段落都推进事实、判断或行动")
     if not checks["重点存在"]:
@@ -869,10 +1342,13 @@ def quality_check(body: str, evidence: list | None = None, length_preset: str = 
     return {"passed": passed_ok, "score": f"{passed}/{len(checks)}", "forbidden_words": hits, "punctuation": punctuation,
             "spoken_markers": spoken, "placeholders": placeholders, "specific_detail": has_specific_detail,
             "plain_length": len(plain), "length_preset": length_preset, "target_length": length,
-            "heading_count": heading_count, "list_count": list_count, "emphasis_count": emphasis_count,
+            "heading_count": heading_count, "h2_count": h2_count, "h3_count": h3_count,
+            "list_count": list_count, "emphasis_count": emphasis_count,
+            "dense_paragraph_count": len(dense_paragraphs), "max_paragraph_length": max(ordinary_lengths or [0]),
             "repeated_paragraphs": repeated_paragraphs, "empty_expression_hits": empty_expression_hits,
-            "evidence_count": len(evidence), "checks": checks, "layers": {
-                "硬性禁用词": checks["硬性规则"], "风格一致性": checks["开头具体"] and checks["节奏层次"] and checks["口语与个人判断"],
+            "evidence_count": len(evidence), "three_second": three_second, "checks": checks, "layers": {
+                "硬性禁用词": checks["硬性规则"], "3秒首屏": checks["3秒首屏"],
+                "风格一致性": checks["开头具体"] and checks["节奏层次"] and checks["口语与个人判断"],
                 "内容支撑": checks["内容支撑"] and checks["证据链"] and checks["信息密度"], "活人感终审": checks["口语与个人判断"] and not placeholders},
             "next_actions": next_actions}
 
@@ -881,17 +1357,74 @@ class ImageParser(HTMLParser):
     def __init__(self, base_url: str):
         super().__init__()
         self.base_url = base_url
-        self.images: list[str] = []
+        self._scoped_images: list[str] = []
+        self._unscoped_images: list[str] = []
+        self._tag_stack: list[tuple[str, bool, bool]] = []
+        self._excluded_depth = 0
+        self._content_depth = 0
+        self.excluded_count = 0
         self.og_image = ""
+
+    @property
+    def images(self) -> list[str]:
+        # Prefer recognized article content once a page exposes it. This keeps
+        # header, recommendation and footer images out of the source pool.
+        return self._scoped_images if self._scoped_images else self._unscoped_images
+
+    @staticmethod
+    def _class_text(attrs_dict: dict[str, str]) -> str:
+        return " ".join(attrs_dict.get(key, "") for key in ("id", "class", "role", "aria-label", "data-testid")).lower()
+
+    @staticmethod
+    def _is_excluded_container(tag: str, marker: str) -> bool:
+        if tag.lower() in {"header", "footer", "nav", "aside"}:
+            return True
+        return any(token in marker for token in EXCLUDED_IMAGE_CONTAINER_MARKERS)
+
+    @staticmethod
+    def _is_content_container(tag: str, marker: str) -> bool:
+        if tag.lower() in {"article", "main"}:
+            return True
+        return any(token in marker for token in CONTENT_IMAGE_CONTAINER_MARKERS)
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attrs_dict = {key.lower(): value or "" for key, value in attrs}
         if tag.lower() == "meta" and attrs_dict.get("property", "").lower() in {"og:image", "twitter:image"}:
-            self.og_image = urljoin(self.base_url, attrs_dict.get("content", ""))
+            candidate = urljoin(self.base_url, attrs_dict.get("content", ""))
+            if not any(token in candidate.lower() for token in NON_ARTICLE_IMAGE_MARKERS):
+                self.og_image = candidate
+        marker = self._class_text(attrs_dict)
+        excluded = self._excluded_depth > 0 or self._is_excluded_container(tag, marker)
+        content = not excluded and self._is_content_container(tag, marker)
+        self._tag_stack.append((tag.lower(), excluded, content))
+        if excluded:
+            self._excluded_depth += 1
+        if content:
+            self._content_depth += 1
         if tag.lower() == "img":
             src = attrs_dict.get("src") or attrs_dict.get("data-src") or attrs_dict.get("data-original")
             if src:
-                self.images.append(urljoin(self.base_url, src))
+                candidate = urljoin(self.base_url, src)
+                if excluded or any(token in candidate.lower() for token in NON_ARTICLE_IMAGE_MARKERS):
+                    self.excluded_count += 1
+                elif self._content_depth:
+                    self._scoped_images.append(candidate)
+                else:
+                    self._unscoped_images.append(candidate)
+
+    def handle_endtag(self, tag: str) -> None:
+        wanted = tag.lower()
+        for index in range(len(self._tag_stack) - 1, -1, -1):
+            if self._tag_stack[index][0] != wanted:
+                continue
+            closing = self._tag_stack[index:]
+            del self._tag_stack[index:]
+            for _, excluded, content in reversed(closing):
+                if excluded:
+                    self._excluded_depth = max(0, self._excluded_depth - 1)
+                if content:
+                    self._content_depth = max(0, self._content_depth - 1)
+            break
 
 
 DECORATIVE_IMAGE_MARKERS = (
@@ -900,9 +1433,27 @@ DECORATIVE_IMAGE_MARKERS = (
     "64x64", "48x48", "32x32", "16x16"
 )
 
+CONTENT_IMAGE_CONTAINER_MARKERS = (
+    "article-content", "article-body", "post-content", "post-body", "entry-content", "story-body",
+    "rich_media_content", "rich_media_area_primary", "main-content", "正文", "文章正文",
+)
+EXCLUDED_IMAGE_CONTAINER_MARKERS = (
+    "comment", "comments", "comment-list", "comment-area", "reply", "replies", "discussion", "discuss",
+    "留言", "评论", "回复", "讨论", "recommend", "recommended", "related", "相关推荐", "sidebar",
+    "side-bar", "advert", "ad-container", "share", "social", "header", "footer", "navigation",
+)
+NON_ARTICLE_IMAGE_MARKERS = (
+    "comment", "comments", "reply", "replies", "discussion", "recommend", "recommended", "related",
+    "avatar", "favicon", "icon", "logo", "emoji", "sticker", "badge", "sprite", "qrcode", "qr-code",
+    "profile", "author", "head", "user", "default", "80-80", "64x64", "48x48", "32x32", "16x16",
+)
+
 
 def image_candidate_reason(url: str, data: bytes, mime: str) -> str:
     lowered = (urlparse(url).path + "?" + urlparse(url).query).lower()
+    for marker in NON_ARTICLE_IMAGE_MARKERS:
+        if marker in lowered:
+            return f"非正文图片特征：{marker}"
     for marker in DECORATIVE_IMAGE_MARKERS:
         if marker in lowered:
             return f"装饰性图片特征：{marker}"
@@ -966,13 +1517,17 @@ def download_url(url: str, max_bytes: int = 6 * 1024 * 1024) -> tuple[bytes, str
 def import_images_from_url(page_url: str, limit: int = 8) -> dict:
     page_bytes, content_type = download_url(page_url, max_bytes=4 * 1024 * 1024)
     candidates = []
+    excluded_count = 0
     if content_type.startswith("image/"):
         candidates = [page_url]
+        source_scope = "direct_image"
     else:
         text = page_bytes.decode("utf-8", errors="ignore")
         parser = ImageParser(page_url)
         parser.feed(text)
         candidates = ([parser.og_image] if parser.og_image else []) + parser.images
+        excluded_count = parser.excluded_count
+        source_scope = "article_body"
     unique = []
     for candidate in candidates:
         if candidate and candidate not in unique and urlparse(candidate).scheme in {"http", "https"}:
@@ -997,29 +1552,59 @@ def import_images_from_url(page_url: str, limit: int = 8) -> dict:
             output = ASSET_DIR / filename
             output.write_bytes(data)
             with db_conn() as conn:
-                cursor = conn.execute("INSERT INTO asset(name,path,kind,source_url,source_page_url,source_kind,rights_note,prompt,usage,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                                     (filename, str(output.relative_to(ROOT)), "image", image_url, page_url, "source", "来源页面已记录，版权待确认", "", "来源图", now_iso()))
+                cursor = conn.execute("INSERT INTO asset(name,path,kind,source_url,source_page_url,source_kind,source_scope,rights_note,prompt,usage,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                                     (filename, str(output.relative_to(ROOT)), "image", image_url, page_url, "source", source_scope, "来源页面正文区域已记录，版权待确认", "", "来源图", now_iso()))
                 imported.append({"id": cursor.lastrowid, "name": filename, "path": str(output.relative_to(ROOT)), "source_url": image_url,
-                                 "source_page_url": page_url, "source_kind": "source", "rights_note": "来源页面已记录，版权待确认"})
+                                 "source_page_url": page_url, "source_kind": "source", "source_scope": source_scope,
+                                 "rights_note": "来源页面正文区域已记录，版权待确认"})
         except Exception:
             continue
         if len(imported) >= max(1, min(limit, 8)):
             break
-    message = f"识别到 {len(unique)} 张候选图，导入 {len(imported)} 张正文候选图"
+    message = f"识别到 {len(unique)} 张正文候选图，导入 {len(imported)} 张正文候选图"
     if skipped:
-        message += f"，过滤 {len(skipped)} 张头像/图标或无效图片"
+        message += f"，过滤 {len(skipped)} 张头像、图标、评论区或无效图片"
+    if excluded_count:
+        message += f"，排除 {excluded_count} 张非正文区域图片"
     return {"page_url": page_url, "found": len(unique), "imported": imported, "skipped": skipped, "message": message}
 
 
 def markdown_text_only(value: str) -> str:
-    value = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", value)
-    value = re.sub(r"^#{1,6}\s+", "", value.strip())
+    value = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", value or "")
+    value = re.sub(r"(?m)^\s*#{1,6}\s+", "", value)
+    value = re.sub(r"(?m)^\s*>\s*", "", value)
+    value = re.sub(r"(?m)^\s*(?:\[[^\]]+\]|引言|方法|技巧|风险|金句)\s*(?:[|｜:：]\s*)?", "", value)
+    value = re.sub(r"(?m)^\s*(?:[-*]|\d+[.)])\s+", "", value)
     value = re.sub(r"[*_`=~^]", "", value)
     return re.sub(r"\s+", " ", value).strip()
 
 
 def image_count_in_markdown(body: str) -> int:
     return len(re.findall(r"!\[[^\]]*\]\([^)]*\)", body or ""))
+
+
+def is_local_fallback_image_ref(source: str) -> bool:
+    name = Path(urlparse(str(source or "")).path).name.lower()
+    return name.startswith(("info-card-", "local-editorial-"))
+
+
+def remove_local_fallback_images(body: str) -> str:
+    """Remove old offline placeholders so a later run can replace them with real images."""
+    pattern = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
+    return pattern.sub(lambda match: "" if is_local_fallback_image_ref(match.group(1).strip()) else match.group(0), body or "")
+
+
+def remove_unscoped_source_images(body: str) -> str:
+    """Drop legacy source-image references that were not verified as article-body images."""
+    references = {match.group(1).strip() for match in re.finditer(r"!\[[^\]]*\]\(([^)]+)\)", body or "")}
+    if not references:
+        return body
+    with db_conn() as conn:
+        rows = conn.execute("SELECT path FROM asset WHERE usage='来源图' AND source_kind='source' AND COALESCE(source_scope,'')!='article_body'").fetchall()
+    blocked = {str(row["path"]) for row in rows if str(row["path"]) in references}
+    if not blocked:
+        return body
+    return re.sub(r"!\[[^\]]*\]\(([^)]+)\)", lambda match: "" if match.group(1).strip() in blocked else match.group(0), body or "")
 
 
 def split_long_image_block(block: str, max_chars: int = 500) -> list[str]:
@@ -1087,9 +1672,68 @@ CONCRETE_VISUAL_TERMS = (
     "金额", "数字", "时间", "聊天", "代码", "文章", "原文", "界面", "会议", "模型",
 )
 
+# The reference workflow uses a restrained editorial poster language rather than
+# a generic "AI illustration" preset. Keep the variation deterministic so the
+# same paragraph does not produce the same composition on every retry.
+ZINE_LAYOUT_RECIPES = (
+    ("lower-left-float", "lower-left quadrant", "torn-paper clipping", "short phrase pressed against the clipping edge", "xerox softness", "quiet archival"),
+    ("upper-right-block", "upper-right quadrant", "solid color paper block", "small typewriter caption below the block", "risograph grain", "distant diary-like"),
+    ("dual-panel", "center-left", "two small overlapping paper fragments", "fragmented floating letters between the fragments", "halftone degradation", "slightly surreal"),
+    ("single-specimen", "lower-middle", "one isolated object specimen", "almost textless with one tiny caption", "scan noise and paper fibers", "calm and observational"),
+    ("irregular-cutout", "upper-middle", "irregular organic paper cutout", "low-contrast archive microtext near the cutout", "letterpress ink bleed", "memory-like"),
+)
+ZINE_ACCENTS = ("tomato red", "cobalt blue", "pear green", "ultramarine", "lemon yellow")
+
+
+def zine_recipe_for(text: str, title: str = "") -> dict:
+    """Pick a stable, varied recipe for the adapted landscape zine mode."""
+    seed = hashlib.sha256(f"{title}\n{text}".encode("utf-8", "ignore")).digest()
+    layout = ZINE_LAYOUT_RECIPES[seed[0] % len(ZINE_LAYOUT_RECIPES)]
+    return {
+        "layout": layout[0],
+        "position": layout[1],
+        "anchor": layout[2],
+        "typography": layout[3],
+        "texture": layout[4],
+        "mood": layout[5],
+        "accent": ZINE_ACCENTS[seed[1] % len(ZINE_ACCENTS)],
+    }
+
+
+def compile_zine_image_prompt(subject: str, visual_intent: str, title: str, source_text: str) -> tuple[str, dict]:
+    """Compile model-extracted meaning into the reference skill's visual grammar."""
+    recipe = zine_recipe_for(source_text, title)
+    subject = re.sub(r"\s+", " ", subject or "").strip(" 。；;，,")[:220]
+    intent = re.sub(r"\s+", " ", visual_intent or "").strip(" 。；;，,")[:160]
+    if not subject:
+        subject = "段落中的一个具体物件、动作或关系"
+    if not intent:
+        intent = "把段落的核心判断压缩成一个可被看见的瞬间"
+    prompt = (
+        f"横版 4:3 公众号正文编辑配图，整幅画面是一张铺满画布的旧纸张，没有边框、没有设备样机。"
+        f"保留约 62%-80% 的安静留白，只让一个中小型视觉集群占据约 18%-35% 画面，放在{recipe['position']}，"
+        "主体比极简海报中的微小锚点稍稍放大，主体本身占视觉集群约 25%-40%，必须完整可辨，不得缩成小点或细线；"
+        "画面保持平视扫描稿关系，不做满幅场景。\n\n"
+        f"把“{subject}”作为唯一主视觉，用{recipe['anchor']}表现；它要承担“{intent}”这一视觉隐喻，"
+        "只保留段落真正需要的对象、动作和关系，不添加随机人物、城市天际线或通用科技符号。"
+        "主体使用灰阶照片、旧印刷插图、纸张碎片或低对比剪影的质感，边缘可以有撕纸、复印、网点和轻微错位。\n\n"
+        f"采用{recipe['typography']}，只允许极短、稀疏、可有可无的打字机或衬线微型字，不出现长句。"
+        f"全图只使用一个明显的高饱和{recipe['accent']}色锚点，呈不透明平面色块、剪纸或主体局部，"
+        "约占整幅 0.8%-2.5%，缩略图也能看见；纸张、照片和辅助标记保持灰黑与米白。"
+        f"整体采用{recipe['texture']}、纸纤维、旧印刷磨损和轻微油墨渗出。\n\n"
+        f"情绪是{recipe['mood']}，克制、安静、像日本或韩国独立 zine 的编辑海报；哑光吸墨纸，漫射光，低到中等对比。"
+        "执行图片 3s 原则，缩略图或首屏停留约 3 秒时，读者必须先看懂一个主体、一个动作或冲突、一个视觉重点；"
+        "如果画面不能用一句短话说清楚，就删掉装饰并强化主体关系。"
+        " "
+        "没有硬阴影、景深或三维纵深。不要出现完整场景铺满、商业广告、品牌 Logo、CTA、水印、干净 UI、"
+        "蓝紫渐变、发光网络、漂浮图标、随机仪表盘、机器人、霓虹、赛博朋克、可爱卡通、时尚大片、"
+        "密集拼贴、过多物件、过多颜色、长段可读文字或无意义的科技装饰。"
+    )
+    return prompt, recipe
+
 
 def paragraph_visual_kind(text: str) -> str:
-    """Choose a visual treatment before asking an image model to draw anything."""
+    """Classify a paragraph for diagnostics; all missing slots use the zine compiler."""
     plain = markdown_text_only(text)
     abstract_score = sum(1 for term in ABSTRACT_VISUAL_TERMS if term in plain)
     concrete_score = sum(1 for term in CONCRETE_VISUAL_TERMS if term in plain)
@@ -1097,6 +1741,18 @@ def paragraph_visual_kind(text: str) -> str:
     if concrete_score >= 2 or (concrete_score and has_number and abstract_score <= concrete_score + 1):
         return "ai_scene"
     return "info_card"
+
+
+def external_image_model_configured() -> bool:
+    """Return whether auto layout can actually call an image endpoint."""
+    if os.getenv("RIGHTCODE_API_KEY", "") or os.getenv("RIGHT_CODE_API_KEY", ""):
+        return True
+    if os.getenv("OPENAI_IMAGE_API_KEY", ""):
+        return True
+    generic_key = os.getenv("OPENAI_API_KEY", "")
+    base = os.getenv("OPENAI_IMAGE_BASE_URL", "") or os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    base = base.lower()
+    return bool(generic_key and "deepseek.com" not in base and "yuzapi.fun" not in base)
 
 
 def source_urls_for_draft(topic: dict, evidence: list) -> list[str]:
@@ -1135,10 +1791,19 @@ def auto_layout_draft_images(draft_id: int, body_override: str = "", title_overr
     title = str(title_override or draft.get("title") or draft.get("topic_title") or "未命名文章").strip()
     if not body:
         raise ValueError("正文为空，先生成或写入文章正文")
+    original_body = body
+    body = remove_unscoped_source_images(body)
+    if external_image_model_configured():
+        body = remove_local_fallback_images(body)
     blocks, positions, target_count = choose_image_blocks(body)
     existing_count = image_count_in_markdown(body)
     if not positions:
-        return {"ok": True, "draft": draft, "target_count": target_count, "inserted": [], "source_imported": [],
+        updated_draft = draft
+        if body != original_body:
+            with db_conn() as conn:
+                conn.execute("UPDATE draft SET body=?,digest=?,updated_at=? WHERE id=?", (body, markdown_text_only(body)[:120], now_iso(), draft_id))
+                updated_draft = row_to_json(conn.execute("SELECT * FROM draft WHERE id=?", (draft_id,)).fetchone()) or draft
+        return {"ok": True, "draft": updated_draft, "target_count": target_count, "inserted": [], "source_imported": [],
                 "generated": [], "failed": [], "message": f"正文已有足够配图（目标 {target_count} 张），暂不重复添加"}
 
     evidence = draft.get("evidence") if isinstance(draft.get("evidence"), list) else []
@@ -1155,7 +1820,7 @@ def auto_layout_draft_images(draft_id: int, body_override: str = "", title_overr
     source_hosts = {urlparse(url).hostname for url in page_urls if urlparse(url).hostname}
     if source_hosts:
         with db_conn() as conn:
-            existing_source_assets = conn.execute("SELECT * FROM asset WHERE kind='image' AND usage='来源图' ORDER BY id DESC LIMIT 120").fetchall()
+            existing_source_assets = conn.execute("SELECT * FROM asset WHERE kind='image' AND usage='来源图' AND source_scope='article_body' ORDER BY id DESC LIMIT 120").fetchall()
         for row in existing_source_assets:
             asset = row_to_json(row) or {}
             if registered_image_candidate_reason(asset):
@@ -1186,9 +1851,10 @@ def auto_layout_draft_images(draft_id: int, body_override: str = "", title_overr
         context = "\n".join(markdown_text_only(blocks[i])[:260] for i in range(max(0, block_index - 1), min(len(blocks), block_index + 2)))
         try:
             visual_kind = paragraph_visual_kind(selected)
-            if visual_kind == "info_card":
+            if not external_image_model_configured():
                 card = generate_local_info_card(selected, "正文信息卡")
                 card["visual_kind"] = visual_kind
+                card["strategy"] = "offline_fallback"
                 placements[block_index] = card
                 info_cards.append(card)
             else:
@@ -1196,6 +1862,8 @@ def auto_layout_draft_images(draft_id: int, body_override: str = "", title_overr
                 generated_asset = generate_image_asset(prompt_result["prompt"], "正文插图")
                 generated_asset["image_prompt"] = prompt_result["prompt"]
                 generated_asset["visual_kind"] = visual_kind
+                generated_asset["strategy"] = "zine_editorial"
+                generated_asset["visual_recipe"] = prompt_result.get("recipe", {})
                 placements[block_index] = generated_asset
                 generated.append(generated_asset)
         except Exception as exc:
@@ -1208,7 +1876,8 @@ def auto_layout_draft_images(draft_id: int, body_override: str = "", title_overr
         updated = conn.execute("SELECT * FROM draft WHERE id=?", (draft_id,)).fetchone()
     completed_count = existing_count + len(inserted)
     remaining_count = max(0, target_count - completed_count)
-    message = f"配图规划 {target_count} 张：来源图 {source_used} 张，信息卡 {len(info_cards)} 张，AI 场景图 {len(generated)} 张，正文现有 {existing_count} 张"
+    replacement_note = "，已替换旧离线卡" if body != original_body else ""
+    message = f"配图规划 {target_count} 张：来源图 {source_used} 张，编辑视觉图 {len(generated)} 张，离线信息卡 {len(info_cards)} 张，正文现有 {existing_count} 张{replacement_note}"
     if remaining_count:
         message += f"，仍缺 {remaining_count} 张"
     if failures:
@@ -1244,10 +1913,10 @@ def image_prompt_from_selection(selected_text: str, title: str = "", context: st
     selected_text = selected_text[:2400]
     context = context.strip()[:1200]
     visual_mode = paragraph_visual_kind(selected_text)
-    prompt = f"""你是公众号编辑部的视觉编辑。请把下面选中的文章段落转换成一条可直接用于图片生成模型的中文提示词。
-不要复述文章，不要生成图片中的文字，不要编造真实人物、品牌标志或新闻现场。画面必须服务于段落中明确出现的事实、对象、动作或环境；如果段落只有抽象判断，就用一个克制、可理解的日常物件或真实空间承载它，不要制造无意义的“科技感”。
-禁止机器人、发光网络、漂浮图标、随机仪表盘、通用蓝紫渐变、无关人物、无关城市天际线和装饰性 3D 图标。
-输出 JSON，字段为 prompt、visual_intent、avoid。prompt 只写最终生图提示词，包含主体、场景、构图、镜头或光线、色彩和编辑视觉风格，并明确“画面内不要出现文字、水印、Logo”。
+    prompt = f"""你是公众号编辑部的视觉策划，不负责自由写一条泛化的 AI 绘画提示词。请先从段落中提炼一个可以被看见的主体、动作或关系，再交给工作台的 Minimal Zine 编辑视觉编译器。
+不要复述文章，不要补造新闻现场、真实人物、品牌标志或事实。不要把抽象观点翻译成“科技感”，要找一个段落中已有的物件、动作、空间或清晰的视觉隐喻。
+执行图片 3s 原则，先问自己，读者看缩略图 3 秒后能不能说出主体、动作或冲突；如果不能，继续收敛为一个更具体的视觉锚点，不要用抽象符号凑图。
+输出严格 JSON，字段为 subject、visual_intent、action、setting、metaphor、caption、avoid。每个字段都是简短中文短语；caption 最多 12 个字，没有必要时留空。不要输出 prompt 字段，不要输出 Markdown。
 
 文章标题：{title}
 上下文：{context}
@@ -1259,17 +1928,39 @@ def image_prompt_from_selection(selected_text: str, title: str = "", context: st
         if match:
             try:
                 result = json.loads(match.group(0))
-                generated = str(result.get("prompt", "")).strip()
-                if generated:
-                    return {"prompt": generated, "visual_intent": str(result.get("visual_intent", "")),
-                            "avoid": str(result.get("avoid", "")), "mode": "model", "visual_mode": visual_mode}
+                subject = str(result.get("subject", "")).strip()
+                visual_intent = str(result.get("visual_intent", "")).strip()
+                if subject or visual_intent:
+                    action = str(result.get("action", "")).strip()
+                    setting = str(result.get("setting", "")).strip()
+                    metaphor = str(result.get("metaphor", "")).strip()
+                    subject_detail = "；".join(item for item in (
+                        subject,
+                        f"动作：{action}" if action else "",
+                        f"场景：{setting}" if setting else "",
+                    ) if item)[:260]
+                    intent_detail = "；".join(item for item in (
+                        visual_intent,
+                        f"隐喻：{metaphor}" if metaphor else "",
+                    ) if item)[:200]
+                    generated, recipe = compile_zine_image_prompt(subject_detail, intent_detail, title, selected_text)
+                    return {"prompt": generated, "visual_intent": visual_intent or "已提炼为一个可见的编辑视觉锚点",
+                            "avoid": str(result.get("avoid", "")).strip(), "mode": "model",
+                            "visual_mode": "zine_editorial", "paragraph_kind": visual_mode,
+                            "render_mode": "zine_editorial", "recipe": recipe}
             except json.JSONDecodeError:
                 pass
-    fallback = (f"为公众号正文制作一张克制的纪实编辑配图，准确围绕段落中的具体内容“{selected_text[:180]}”取一个可视化瞬间；"
-                "优先使用真实日常物件、工作台、纸张、屏幕、手部动作或室内环境，不添加段落没有提到的人物和符号；"
-                "自然光，低饱和米白、墨黑、少量朱砂红，平面摄影或杂志纪实摄影，构图清楚，留白适中，横向 4:3。"
-                "画面内不要出现文字、水印、Logo、机器人、发光网络、漂浮图标、蓝紫渐变和通用科技背景。")
-    return {"prompt": fallback, "visual_intent": "把段落中的具体对象或动作转成纪实配图", "avoid": "文字、水印、Logo、机器人、发光网络、漂浮图标、通用科技背景", "mode": "local_fallback", "visual_mode": visual_mode, "model_note": error or "未配置文本模型，使用本地提示词转换"}
+    fallback, recipe = compile_zine_image_prompt(
+        "段落中的具体对象、动作或关系",
+        f"围绕“{selected_text[:120]}”取一个可视化瞬间",
+        title,
+        selected_text,
+    )
+    return {"prompt": fallback, "visual_intent": "将段落压缩为一个具体视觉锚点",
+            "avoid": "文字、水印、Logo、机器人、发光网络、漂浮图标、蓝紫渐变、通用科技背景",
+            "mode": "local_fallback", "visual_mode": "zine_editorial", "paragraph_kind": visual_mode,
+            "render_mode": "zine_editorial",
+            "recipe": recipe, "model_note": error or "未配置文本模型，使用本地视觉编译器"}
 
 
 def save_generated_image(raw: bytes, prompt: str, usage: str, rights_note: str) -> dict:
@@ -1327,7 +2018,10 @@ def generate_rightcode_image(prompt: str, usage: str, api_key: str) -> dict:
     requested_model = os.getenv("RIGHTCODE_IMAGE_MODEL", os.getenv("RIGHT_CODE_IMAGE_MODEL", "gpt-image-2")).strip() or "gpt-image-2"
     model_aliases = {"image2": "gpt-image-2", "image2-vip": "gpt-image-2-vip"}
     model = model_aliases.get(requested_model.lower(), requested_model)
-    size = os.getenv("RIGHTCODE_IMAGE_SIZE", "16:9" if "封面" in usage else "4:3")
+    requested_size = os.getenv("RIGHTCODE_IMAGE_SIZE", "16:9" if "封面" in usage else "4:3").strip() or ("16:9" if "封面" in usage else "4:3")
+    # Right Code documents 1:1, 16:9, 9:16, 4:3 and pixel sizes; 3:2 was
+    # previously used by the local prompt compiler but is rejected by this API.
+    size = {"3:2": "4:3", "2:3": "4:3"}.get(requested_size, requested_size)
     image_size = os.getenv("RIGHTCODE_IMAGE_RESOLUTION", "1K" if model.startswith(("gpt-image-2", "nano-banana")) else "").strip()
     payload = {"model": model, "prompt": prompt, "n": 1, "size": size, "async": True}
     if image_size:
@@ -1439,12 +2133,41 @@ def write_editorial_png(output: Path) -> None:
 
 
 def wechat_compatible_image_path(asset_path: Path) -> Path:
-    """Convert legacy local SVG cards to PNG because WeChat rejects SVG uploads."""
-    if asset_path.suffix.lower() != ".svg":
+    """Normalize uploads to JPEG when the source format is not reliably accepted."""
+    suffix = asset_path.suffix.lower()
+    if suffix in {".jpg", ".jpeg", ".png"}:
         return asset_path
-    output = asset_path.with_suffix(".png")
-    if not output.exists():
-        write_editorial_png(output)
+    if suffix == ".svg":
+        output = asset_path.with_suffix(".png")
+        if not output.exists():
+            write_editorial_png(output)
+        return output
+    if Image is None:
+        if sys.platform == "darwin" and suffix in {".webp", ".avif", ".gif"}:
+            output = asset_path.with_name(asset_path.stem + "-wechat.jpg")
+            try:
+                subprocess.run(["sips", "-s", "format", "jpeg", str(asset_path), "--out", str(output)],
+                               check=True, capture_output=True, text=True, timeout=30)
+                if output.exists() and output.stat().st_size:
+                    return output
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise RuntimeError(f"Mac 图片转换失败：{asset_path.name}，{exc}") from exc
+        raise RuntimeError(f"微信不支持 {suffix or '该'} 图片格式，当前环境缺少 Pillow，无法转换为 JPEG")
+    output = asset_path.with_name(asset_path.stem + "-wechat.jpg")
+    try:
+        with Image.open(asset_path) as source:
+            # Animated GIFs use their first frame; WeChat articles need a
+            # single raster image, and WebP/AVIF are normalized to JPEG.
+            try:
+                source.seek(0)
+            except Exception:
+                pass
+            image = source.convert("RGBA")
+            background = Image.new("RGB", image.size, "white")
+            background.paste(image, mask=image.getchannel("A"))
+            background.save(output, format="JPEG", quality=88, optimize=True)
+    except Exception as exc:
+        raise RuntimeError(f"图片无法转换为微信公众号兼容格式：{asset_path.name}，{exc}") from exc
     return output
 
 
@@ -1550,10 +2273,14 @@ def generate_local_info_card(text: str, usage: str = "正文信息卡") -> dict:
 
 def md_to_html(markdown: str, image_map: dict[str, str] | None = None) -> str:
     image_map = image_map or {}
-    lines = markdown.replace("\r\n", "\n").split("\n")
+    render_blocks: list[str] = []
+    for block in [item.strip() for item in re.split(r"\n\s*\n", markdown.replace("\r\n", "\n")) if item.strip()]:
+        render_blocks.extend(split_readability_paragraph(block))
+    lines = "\n\n".join(render_blocks).split("\n")
     output: list[str] = []
     list_tag = ""
-    lead_paragraph = True
+    h2_number = 0
+    paragraph_streak = 0
 
     def close_list() -> None:
         nonlocal list_tag
@@ -1569,29 +2296,64 @@ def md_to_html(markdown: str, image_map: dict[str, str] | None = None) -> str:
         image_match = re.match(r"!\[([^\]]*)\]\(([^)]+)\)", line)
         if image_match:
             close_list()
+            paragraph_streak = 0
             alt, src = image_match.groups()
             src = image_map.get(src, src)
-            output.append(f'<p style="margin:28px 0;text-align:center"><img src="{html.escape(src, quote=True)}" alt="{html.escape(alt, quote=True)}" style="max-width:100%;height:auto;display:block;margin:0 auto;border-radius:2px"></p>')
-            lead_paragraph = False
+            output.append(
+                f'<p class="wechat-image" style="margin:32px 0;text-align:center;line-height:0">'
+                f'<img src="{html.escape(src, quote=True)}" alt="{html.escape(alt, quote=True)}" '
+                'style="width:100%;max-width:100%;height:auto;display:block;margin:0 auto;padding:4px;box-sizing:border-box;'
+                'border:1px solid #e0d8cc;border-radius:3px;background:#ffffff;box-shadow:0 8px 20px rgba(50,42,32,.08)"></p>'
+            )
         elif line == "---":
             close_list()
-            output.append('<hr style="border:0;border-top:1px solid #d8d0c3;margin:28px 0">')
+            paragraph_streak = 0
+            output.append('<hr style="border:0;border-top:1px solid #d8d0c3;margin:30px 0">')
         elif line.startswith("> "):
             close_list()
-            output.append(f'<blockquote style="margin:22px 0;padding:13px 16px;border-left:4px solid #b44735;background:#f4eee4;color:#625b50;line-height:1.9">{inline_html(line[2:], image_map)}</blockquote>')
+            paragraph_streak = 0
+            quote = line[2:].strip()
+            label_match = re.match(r"^\[(引言|方法|技巧|风险|金句)\]\s*(.*)$", quote)
+            if label_match:
+                label, content = label_match.groups()
+                styles = {
+                    "引言": ("wechat-lead", "#b44735", "#fbf7ef", "#5d574f", "引言", "border-top:1px solid #b44735;border-bottom:1px solid #b44735"),
+                    "方法": ("wechat-method", "#758d55", "#f1f4e8", "#3f5130", "方法", "border:1px solid #bdc9a8;border-left:5px solid #758d55"),
+                    "技巧": ("wechat-method", "#758d55", "#f1f4e8", "#3f5130", "技巧", "border:1px solid #bdc9a8;border-left:5px solid #758d55"),
+                    "风险": ("wechat-risk", "#b44735", "#f8ece8", "#713329", "风险", "border:1px solid #dfb7ae;border-left:5px solid #b44735"),
+                    "金句": ("wechat-punchline", "#1d1c19", "#f3efe7", "#1d1c19", "金句", "border:1px solid #aaa196"),
+                }[label]
+                class_name, border, background, color, display_label, frame = styles
+                output.append(
+                    f'<div class="wechat-callout {class_name}" style="margin:28px 0;padding:17px 19px;{frame};background:{background};color:{color};line-height:1.95;border-radius:2px">'
+                    f'<div style="margin-bottom:8px"><span style="display:inline-block;padding:2px 7px;border:1px solid {border};'
+                    f'font-size:10px;line-height:1.4;letter-spacing:.12em;color:{border}">{display_label}</span></div>'
+                    f'<div style="font-size:16px;letter-spacing:.02em">{inline_html(content, image_map)}</div></div>'
+                )
+            else:
+                output.append(f'<blockquote style="margin:28px 0;padding:16px 19px;border-left:4px solid #b44735;background:#fbf7ef;color:#625b50;line-height:1.95">{inline_html(quote, image_map)}</blockquote>')
         elif line.startswith("### "):
             close_list()
-            output.append(f'<h3 style="font-size:17px;line-height:1.5;margin:1.8em 0 .7em;color:#4f483e">{inline_html(line[4:], image_map)}</h3>')
-            lead_paragraph = True
+            paragraph_streak = 0
+            output.append(f'<h3 class="wechat-h3" style="font-size:17px;line-height:1.6;margin:34px 0 15px;padding-left:12px;border-left:3px solid #758d55;color:#403c35;font-weight:700;letter-spacing:.02em">{inline_html(line[4:], image_map)}</h3>')
         elif line.startswith("## "):
             close_list()
-            output.append(f'<h2 style="font-size:19px;line-height:1.5;margin:2.2em 0 .9em;padding:14px 0 0;border-top:1px solid #d8d0c3;color:#1d1c19">{inline_html(line[3:], image_map)}</h2>')
-            lead_paragraph = True
+            paragraph_streak = 0
+            h2_number += 1
+            output.append(
+                f'<h2 class="wechat-h2" style="font-size:20px;line-height:1.55;margin:48px 0 24px;padding:15px 16px 14px;'
+                'border:1px solid #d8d0c3;border-left:5px solid #b44735;background:#fbf8f1;box-shadow:4px 4px 0 #eee7db;'
+                'color:#1d1c19;font-weight:700;letter-spacing:.01em">'
+                f'<span style="display:inline-block;vertical-align:middle;margin-right:10px;padding:2px 7px;border:1px solid #b44735;'
+                f'background:#b44735;color:#fffdf8;font-size:11px;line-height:1.4;font-weight:600;letter-spacing:.08em">{h2_number:02d}</span>'
+                f'<span style="vertical-align:middle">{inline_html(line[3:], image_map)}</span></h2>'
+            )
         elif line.startswith("# "):
             close_list()
+            paragraph_streak = 0
             output.append(f'<h1 style="font-size:28px;line-height:1.35;margin:0 0 1.2em;color:#1d1c19">{inline_html(line[2:], image_map)}</h1>')
-            lead_paragraph = True
         elif re.match(r"^[-*] ", line) or re.match(r"^\d+[.)] ", line):
+            paragraph_streak = 0
             wanted = "ol" if re.match(r"^\d+[.)] ", line) else "ul"
             if list_tag != wanted:
                 close_list()
@@ -1601,24 +2363,36 @@ def md_to_html(markdown: str, image_map: dict[str, str] | None = None) -> str:
             output.append(f"<li>{inline_html(content, image_map)}</li>")
         else:
             close_list()
-            if lead_paragraph:
-                output.append(f'<p style="margin:0 0 1.2em;line-height:2;color:#3f3a34;font-size:16px">{inline_html(line, image_map)}</p>')
-                lead_paragraph = False
-            else:
-                output.append(f'<p style="margin:0 0 1.2em;line-height:2;color:#3f3a34;font-size:16px">{inline_html(line, image_map)}</p>')
+            paragraph_streak += 1
+            plain_length = len(markdown_text_only(line))
+            bottom_space = 30 if paragraph_streak % 3 == 0 or plain_length <= 24 else 18
+            rhythm_class = " wechat-breath" if bottom_space == 30 else ""
+            output.append(f'<p class="wechat-paragraph{rhythm_class}" style="margin:0;padding:0 0 {bottom_space}px;line-height:1.95;color:#3f3a34;font-size:17px;letter-spacing:.02em;text-align:justify;word-break:break-word">{inline_html(line, image_map)}</p>')
     close_list()
     return "".join(output)
 
 
 def inline_html(value: str, image_map: dict[str, str]) -> str:
     escaped = html.escape(value)
-    escaped = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r'<a href="\2">\1</a>', escaped)
-    escaped = re.sub(r"\*\*([^*]+)\*\*", r'<strong>\1</strong>', escaped)
-    escaped = re.sub(r"==([^=]+)==", r'<mark style="background:#eff5b7;color:#343b20;padding:0 3px">\1</mark>', escaped)
-    escaped = re.sub(r"__([^_]+)__", r'<u style="text-decoration-color:#b44735;text-underline-offset:3px">\1</u>', escaped)
+    escaped = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r'<a href="\2" style="color:#657c47;text-decoration:underline;text-underline-offset:3px">\1</a>', escaped)
+    escaped = re.sub(r"\*\*([^*]+)\*\*", r'<strong style="color:#1d1c19;font-weight:700">\1</strong>', escaped)
+    escaped = re.sub(r"==([^=]+)==", r'<mark style="background:#eef2af;color:#30351f;padding:1px 3px">\1</mark>', escaped)
+    escaped = re.sub(r"__([^_]+)__", r'<u style="text-decoration-color:#758d55;text-decoration-thickness:2px;text-underline-offset:4px;font-weight:600">\1</u>', escaped)
     escaped = re.sub(r"\^\^([^\^]+)\^\^", r'<span style="color:#b44735;font-weight:600">\1</span>', escaped)
     escaped = re.sub(r"`([^`]+)`", r'<code style="background:#eee8dc;padding:2px 5px;border-radius:4px">\1</code>', escaped)
     return escaped
+
+
+def wechat_error_message(data: dict, fallback: str = "微信接口请求失败") -> str:
+    message = str(data.get("errmsg", "") or fallback) if isinstance(data, dict) else fallback
+    lowered = message.lower()
+    if "not in whitelist" in lowered or "invalid ip" in lowered or data.get("errcode") == 40164:
+        match = re.search(r"invalid ip\s+((?:\d{1,3}\.){3}\d{1,3})", message, re.I)
+        ip = match.group(1) if match else "当前出口 IP"
+        return f"公众号 IP 白名单未包含 {ip}。请到公众号后台的 设置与开发 → 基本配置 → IP 白名单，添加 {ip}（只填 IPv4，不要填写 ::ffff: 前缀），保存后再重试。"
+    if "unsupported file type" in lowered or "invalid file type" in lowered:
+        return "微信拒绝了上传的图片格式。工作台会在重试时把 WebP、AVIF、GIF 等图片转换为 JPEG；请重启工作台后再试。"
+    return message
 
 
 class WeChatClient:
@@ -1631,7 +2405,6 @@ class WeChatClient:
     @property
     def configured(self) -> bool:
         return bool(self.app_id and self.app_secret)
-
     def access_token(self) -> str:
         if self.token and time.time() < self.expires_at - 120:
             return self.token
@@ -1640,7 +2413,7 @@ class WeChatClient:
         query = f"grant_type=client_credential&appid={quote(self.app_id)}&secret={quote(self.app_secret)}"
         status, data, _ = http_json("https://api.weixin.qq.com/cgi-bin/token?" + query)
         if status == 0 or data.get("errcode"):
-            raise RuntimeError(data.get("errmsg", "微信 access_token 获取失败"))
+            raise RuntimeError(wechat_error_message(data, "微信 access_token 获取失败"))
         self.token = data["access_token"]
         self.expires_at = time.time() + int(data.get("expires_in", 7200))
         return self.token
@@ -1650,7 +2423,7 @@ class WeChatClient:
         separator = "&" if "?" in endpoint else "?"
         status, data, _ = http_json("https://api.weixin.qq.com" + endpoint + separator + "access_token=" + quote(token), method="POST" if payload is not None else "GET", payload=payload)
         if status == 0 or data.get("errcode"):
-            raise RuntimeError(data.get("errmsg", "微信接口请求失败"))
+            raise RuntimeError(wechat_error_message(data))
         return data
 
     def test(self) -> dict:
@@ -1671,7 +2444,7 @@ class WeChatClient:
         with urlopen(req, timeout=30, context=TLS_CONTEXT) as response:
             result = json.loads(response.read().decode("utf-8"))
         if result.get("errcode"):
-            raise RuntimeError(result.get("errmsg", "微信封面上传失败"))
+            raise RuntimeError(wechat_error_message(result, "微信封面上传失败"))
         return result["media_id"]
 
     def upload_inline(self, asset_path: Path) -> str:
@@ -1688,11 +2461,12 @@ class WeChatClient:
         with urlopen(req, timeout=30, context=TLS_CONTEXT) as response:
             result = json.loads(response.read().decode("utf-8"))
         if result.get("errcode"):
-            raise RuntimeError(result.get("errmsg", "微信正文图片上传失败"))
+            raise RuntimeError(wechat_error_message(result, "微信正文图片上传失败"))
         return result["url"]
 
     def add_draft(self, title: str, digest: str, content: str, cover_media_id: str = "") -> dict:
-        article = {"title": title[:64], "author": os.getenv("WECHAT_AUTHOR", ""), "digest": digest[:120], "content": content,
+        clean_digest = markdown_text_only(digest)[:120]
+        article = {"title": title[:64], "author": os.getenv("WECHAT_AUTHOR", ""), "digest": clean_digest, "content": content,
                    "content_source_url": "", "need_open_comment": 1, "only_fans_can_comment": 0, "show_cover_pic": 1}
         if cover_media_id:
             article["thumb_media_id"] = cover_media_id
@@ -1725,12 +2499,21 @@ def registered_asset_path(value: str) -> Path:
 
 
 def markdown_preview(markdown: str) -> str:
-    return md_to_html(markdown).replace("<p>", '<p style="margin:0 0 1.1em;line-height:1.9">').replace("<h1>", '<h1 style="font-family:Georgia,serif;font-size:28px">').replace("<h2>", '<h2 style="font-family:Georgia,serif;font-size:20px;margin-top:1.8em">').replace("<h3>", '<h3 style="font-family:Georgia,serif;font-size:16px;margin-top:1.5em">')
+    return md_to_html(markdown)
 
 
-def prepare_wechat_content(markdown: str) -> str:
-    """Upload local markdown images before building the WeChat HTML body."""
+def prepare_wechat_content(markdown: str, cover_asset_path: Path | None = None) -> str:
+    """Upload local images and put the selected cover at the top of the body."""
     image_map: dict[str, str] = {}
+    cover_html = ""
+    if cover_asset_path and cover_asset_path.exists() and cover_asset_path.is_file():
+        cover_url = WECHAT.upload_inline(cover_asset_path)
+        cover_html = (
+            '<p class="wechat-cover" style="margin:0 0 30px;text-align:center;line-height:0;">'
+            f'<img src="{html.escape(cover_url, quote=True)}" alt="文章封面" '
+            'style="display:block;width:100%;max-width:900px;height:auto;margin:0 auto;" />'
+            '</p>'
+        )
     for match in re.finditer(r"!\[[^\]]*\]\(([^)]+)\)", markdown):
         source = match.group(1).strip()
         if source in image_map or urlparse(source).scheme in {"http", "https"}:
@@ -1741,7 +2524,7 @@ def prepare_wechat_content(markdown: str) -> str:
                 image_map[source] = WECHAT.upload_inline(asset_path)
         except Exception as exc:
             raise RuntimeError(f"正文图片上传失败：{source}，{exc}") from exc
-    return md_to_html(markdown, image_map)
+    return cover_html + md_to_html(markdown, image_map)
 
 
 def dashboard() -> dict:
@@ -1751,20 +2534,24 @@ def dashboard() -> dict:
         writing_count = conn.execute("SELECT COUNT(*) AS count FROM draft WHERE status NOT IN ('草稿已创建','已归档')").fetchone()["count"]
         asset_count = conn.execute("SELECT COUNT(*) AS count FROM asset").fetchone()["count"]
         metric_count = conn.execute("SELECT COUNT(*) AS count FROM metric_record").fetchone()["count"]
-    model_configured = bool(os.getenv("OPENAI_API_KEY") or os.getenv("DEEPSEEK_API_KEY") or os.getenv("RIGHTCODE_API_KEY") or os.getenv("RIGHT_CODE_API_KEY"))
+    model_configured = bool(os.getenv("YUZAPI_API_KEY") or os.getenv("YUZ_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("DEEPSEEK_API_KEY") or os.getenv("RIGHTCODE_API_KEY") or os.getenv("RIGHT_CODE_API_KEY"))
     return {"hot_count": hot_count, "topic_count": topic_count, "writing_count": writing_count, "asset_count": asset_count, "metric_count": metric_count,
             "style": {"name": "数字生命卡兹克", "skill_loaded": bool(STYLE_CONTEXT.get("skill_path")), "sample_count": len(STYLE_CONTEXT.get("samples", []))},
             "integrations": {"aihot": True, "model": model_configured, "wechat": WECHAT.configured}}
 
 
 def integration_status() -> dict:
-    model_configured = bool(os.getenv("OPENAI_API_KEY") or os.getenv("DEEPSEEK_API_KEY") or os.getenv("RIGHTCODE_API_KEY") or os.getenv("RIGHT_CODE_API_KEY"))
+    provider, model = active_text_model()
+    image_configured = bool(os.getenv("RIGHTCODE_API_KEY") or os.getenv("RIGHT_CODE_API_KEY") or os.getenv("OPENAI_IMAGE_API_KEY"))
+    model_configured = text_model_configured() or image_configured
     return {
         "local": {"ok": True, "host": HOST, "message": "仅绑定本机，凭据不写入内容库"},
         "aihot": {"ok": True, "configured": True, "name": "AI HOT", "message": "公开只读热点接口，可同步并缓存"},
         "model": {"ok": model_configured, "configured": model_configured,
-                  "name": "写作 / 图片模型", "message": "支持 DeepSeek/OpenAI 写作与 Right Code 图片模型中转配图；未配置时使用本地模板",
-                  "env": ["OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL", "DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL", "OPENAI_IMAGE_API_KEY", "OPENAI_IMAGE_BASE_URL", "OPENAI_IMAGE_MODEL", "RIGHTCODE_API_KEY", "RIGHTCODE_IMAGE_MODEL", "RIGHTCODE_IMAGE_SIZE"]},
+                  "name": "写作 / 图片模型", "provider": provider, "text_model": model,
+                  "text_configured": text_model_configured(), "image_configured": image_configured,
+                  "message": f"当前写作模型：{provider} {model}；临时故障会明确标记备用模型，不伪装成首选模型",
+                  "env": ["RIGHTCODE_API_KEY", "RIGHTCODE_TEXT_BASE_URL", "RIGHTCODE_TEXT_MODEL", "RIGHTCODE_TEXT_TIMEOUT", "RIGHTCODE_JSON_MODE", "YUZAPI_API_KEY", "YUZAPI_BASE_URL", "YUZAPI_MODEL", "YUZAPI_JSON_MODE", "YUZAPI_OMIT_TEMPERATURE", "YUZAPI_FALLBACK_ENABLED", "TEXT_MODEL_TIMEOUT", "TEXT_MODEL_FALLBACK_TIMEOUT", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL", "DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL", "OPENAI_IMAGE_API_KEY", "OPENAI_IMAGE_BASE_URL", "OPENAI_IMAGE_MODEL", "RIGHTCODE_IMAGE_BASE_URL", "RIGHTCODE_TASK_BASE_URL", "RIGHTCODE_IMAGE_MODEL", "RIGHTCODE_IMAGE_SIZE"]},
         "wechat": {"ok": WECHAT.configured, "configured": WECHAT.configured, "name": "微信公众号",
                    "message": "只创建草稿，不执行群发" if WECHAT.configured else "本地创作可用；配置后才能写入公众号草稿箱",
                    "env": ["WECHAT_APP_ID", "WECHAT_APP_SECRET", "WECHAT_AUTHOR"],
@@ -1967,12 +2754,13 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(generate_draft(draft_id, body.get("length_preset")))
                 if action == "readability":
                     with db_conn() as conn:
-                        draft_for_layout = conn.execute("SELECT title,body FROM draft WHERE id=?", (draft_id,)).fetchone()
+                        draft_for_layout = conn.execute("SELECT title,body,digest FROM draft WHERE id=?", (draft_id,)).fetchone()
                     if not draft_for_layout:
                         raise ValueError("草稿不存在")
                     layout = readability_markup(str(body.get("body", "")) or draft_for_layout["body"] or "", str(body.get("title", "")) or draft_for_layout["title"] or "")
                     with db_conn() as conn:
-                        conn.execute("UPDATE draft SET body=?,digest=?,status=?,updated_at=? WHERE id=?", (layout["body"], markdown_text_only(layout["body"])[:120], "待排版", now_iso(), draft_id))
+                        digest = markdown_text_only(draft_for_layout["digest"] or "")[:120] or markdown_text_only(layout["body"])[:120]
+                        conn.execute("UPDATE draft SET body=?,digest=?,status=?,updated_at=? WHERE id=?", (layout["body"], digest, "待排版", now_iso(), draft_id))
                         updated = conn.execute("SELECT * FROM draft WHERE id=?", (draft_id,)).fetchone()
                     layout["draft"] = row_to_json(updated)
                     return self.send_json(layout)
@@ -1987,7 +2775,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(result)
                 with db_conn() as conn:
                     preset = normalize_length_preset(body.get("length_preset", "standard"))
-                    conn.execute("UPDATE draft SET title=?,digest=?,body=?,length_preset=?,status=?,cover_asset_id=?,updated_at=? WHERE id=?", (body.get("title", ""), body.get("digest", ""), body.get("body", ""), preset, body.get("status", "写作中"), body.get("cover_asset_id") or None, now_iso(), draft_id))
+                    clean_digest = markdown_text_only(str(body.get("digest", "")))[:120] or markdown_text_only(str(body.get("body", "")))[:120]
+                    conn.execute("UPDATE draft SET title=?,digest=?,body=?,length_preset=?,status=?,cover_asset_id=?,updated_at=? WHERE id=?", (body.get("title", ""), clean_digest, body.get("body", ""), preset, body.get("status", "写作中"), body.get("cover_asset_id") or None, now_iso(), draft_id))
                 return self.send_json({"ok": True})
             if path == "/api/assets/import-url":
                 return self.send_json(import_images_from_url(str(body.get("url", "")).strip()))
@@ -2045,11 +2834,13 @@ class Handler(BaseHTTPRequestHandler):
                     job_id = cursor.lastrowid
                 try:
                     cover_media = ""
+                    cover_asset_path = None
                     with db_conn() as conn:
                         asset = conn.execute("SELECT * FROM asset WHERE id=?", (draft["cover_asset_id"],)).fetchone() if draft["cover_asset_id"] else conn.execute("SELECT * FROM asset WHERE kind='image' ORDER BY CASE WHEN name LIKE '%cover%' OR name LIKE '%封面%' OR name LIKE '01%' THEN 0 ELSE 1 END, id LIMIT 1").fetchone()
                     if asset:
-                        cover_media = WECHAT.upload_cover(safe_relative_path(asset["path"]))
-                    content = prepare_wechat_content(draft["body"])
+                        cover_asset_path = safe_relative_path(asset["path"])
+                        cover_media = WECHAT.upload_cover(cover_asset_path)
+                    content = prepare_wechat_content(draft["body"], cover_asset_path)
                     result = WECHAT.add_draft(draft["title"], draft["digest"], content, cover_media)
                     with db_conn() as conn:
                         conn.execute("UPDATE publish_job SET media_id=?,status=?,message=?,updated_at=? WHERE id=?", (result.get("media_id", ""), "草稿已创建", "已写入公众号草稿箱", now_iso(), job_id))

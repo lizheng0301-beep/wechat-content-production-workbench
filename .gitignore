@@ -10,6 +10,9 @@ __pycache__/
 
 # 本地生成或导入的图片、视频与素材目录
 *_assets/
+/cloudflare-wallet-images/
+/seedrealtime-assets/
+/self-media/
 *.png
 *.jpg
 *.jpeg
